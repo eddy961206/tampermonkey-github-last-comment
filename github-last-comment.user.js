@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GitHub 이슈 목록 - 마지막 댓글 작성자
 // @namespace    https://github.com/
-// @version      1.5.0
-// @description  마지막 일반 댓글을 빠르고 작게 표시한다. 가시 영역 우선 조회, 이전 결과 유지, 증분 DOM 처리와 목록 도구모음을 지원한다.
+// @version      1.6.0
+// @description  제목 아래 마지막 댓글 작성자와 날짜·요일을 작게 표시하고, 마우스/키보드로 댓글 본문을 미리 본다.
 // @match        https://github.com/*
 // @icon         https://github.githubassets.com/favicons/favicon.svg
 // @grant        GM_registerMenuCommand
@@ -15,7 +15,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.5.0';
+  const VERSION = '1.6.0';
   const CONFIG = Object.freeze({
     cacheMinutes: 2,
     noCommentCacheSeconds: 60,
@@ -30,6 +30,8 @@
     staleMinutes: 15,        // 이전 결과는 반드시 이전 결과라고 표시한다
     prefetchMargin: 240,
     maintenanceMs: 30_000,
+    previewChars: 16_000,
+    maxPreviews: 80,
     showAvatar: true,
     showNoComments: true,
   });
@@ -42,7 +44,7 @@
   const MARKER = 'gh-last-comment-author';
   const OWN = 'data-gh-lca-owned';
   const STYLE_ID = 'gh-last-comment-author-style';
-  const SINGLETON = '__ghLca15Running';
+  const SINGLETON = '__ghLca16Running';
   if (document[SINGLETON]) return;
   document[SINGLETON] = true;
 
@@ -168,6 +170,7 @@
     const key = cacheKey(info, me); memoryCache.delete(key); storageDelete(key);
   }
   function setCache(info, signature, me, result) {
+    rememberPreview(info, me, result);
     const value = result.kind === 'none' ? { kind: 'none' } : {
       kind: 'comment', author: result.author, avatar: safeAvatar(result.avatar), time: result.time,
       commentUrl: result.commentUrl, isBot: !!result.isBot, mentionsMe: !!result.mentionsMe,
@@ -471,8 +474,46 @@
     if (!latest) return { kind: 'none' };
     const { commentId, _mentionSource, _mentionLogin, ...result } = latest;
     result.mentionsMe = _mentionSource ? mentioned(_mentionSource, _mentionLogin) : !!result.mentionsMe;
+    result.preview = previewText(_mentionSource);
     return result;
   }
+  // 본문은 페이지 메모리에만 보관한다. sessionStorage/localStorage/진단 로그에는 쓰지 않는다.
+  const previewCache = new Map();
+  const previewKey = (info, me, url) => `${me.toLowerCase()}|${info.key}|${url}`;
+  function previewText(source) {
+    if (!obj(source)) return { available: false, text: '', truncated: false };
+    let text, available = false;
+    for (const key of ['bodyText', 'body_text', 'body', 'rawBody', 'raw_body']) {
+      if (typeof source[key] === 'string') { text = source[key]; available = true; break; }
+    }
+    if (!available) {
+      const html = ['bodyHTML', 'bodyHtml', 'body_html'].find(k => typeof source[k] === 'string');
+      if (html) {
+        const template = document.createElement('template'); template.innerHTML = source[html];
+        template.content.querySelectorAll('script,style,iframe,object,embed').forEach(n => n.remove());
+        template.content.querySelectorAll('img').forEach(n => n.replaceWith(document.createTextNode(n.alt ? `[${n.alt}]` : '[이미지]')));
+        template.content.querySelectorAll('br').forEach(n => n.replaceWith(document.createTextNode('\n')));
+        template.content.querySelectorAll('p,div,li,pre,blockquote,h1,h2,h3,h4,h5,h6,tr').forEach(n => n.append(document.createTextNode('\n')));
+        text = template.content.textContent || ''; available = true;
+      }
+    }
+    text = (text || '').replace(/\r\n?/g, '\n').trim();
+    return { available, text: text.slice(0, CONFIG.previewChars), truncated: text.length > CONFIG.previewChars };
+  }
+  function rememberPreview(info, me, result) {
+    if (result.kind !== 'comment' || !result.preview) return;
+    const key = previewKey(info, me, result.commentUrl);
+    previewCache.delete(key);
+    previewCache.set(key, { ...result.preview, at: Date.now() });
+    while (previewCache.size > CONFIG.maxPreviews) previewCache.delete(previewCache.keys().next().value);
+  }
+  function getPreview(record) {
+    if (record.value?.kind !== 'comment') return null;
+    const key = previewKey(record.info, context.me, record.value.commentUrl), entry = previewCache.get(key);
+    if (!entry || Date.now() - entry.at >= staleTTL) { previewCache.delete(key); return null; }
+    previewCache.delete(key); previewCache.set(key, entry); return entry;
+  }
+
   function addComments(edges, info, me, into) {
     for (const edge of edges) {
       const candidate = commentFromNode(edge?.node, info, me);
@@ -699,14 +740,16 @@
     if (!style) { style = document.createElement('style'); style.id = STYLE_ID; document.head.append(style); }
     style.setAttribute(OWN, '');
     style.textContent = `
-      .${MARKER},.gh-lca-bar{--lca-bg:var(--bgColor-default,var(--color-canvas-default,#fff));--lca-muted-bg:var(--bgColor-muted,var(--color-canvas-subtle,#f6f8fa));--lca-border:var(--borderColor-default,var(--color-border-default,#d1d9e0));--lca-fg:var(--fgColor-default,var(--color-fg-default,#1f2328));--lca-muted:var(--fgColor-muted,var(--color-fg-muted,#59636e));--lca-accent:var(--fgColor-accent,var(--color-accent-fg,#0969da));box-sizing:border-box;font:400 12px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--lca-fg)}
-      .${MARKER} *,.gh-lca-bar *{box-sizing:border-box}
-      .${MARKER}{display:inline-flex;vertical-align:middle;align-items:center;gap:7px;width:282px;max-width:100%;min-width:0;height:30px;margin:3px 0 3px 8px;padding:0 3px 0 8px;border:1px solid var(--lca-border);border-radius:6px;background:var(--lca-bg);white-space:nowrap;text-align:left}
-      .${MARKER}[data-detail="true"]{width:354px}
-      .${MARKER}[hidden],.gh-lca-bar [hidden]{display:none!important}
-      .${MARKER} .gh-lca-main{display:inline-flex;align-items:center;flex:1;gap:6px;min-width:0;color:inherit;text-decoration:none!important;font:inherit;outline-offset:2px}
+      .gh-lca-line,.${MARKER},.gh-lca-preview,.gh-lca-bar{--lca-bg:var(--bgColor-default,var(--color-canvas-default,#fff));--lca-muted-bg:var(--bgColor-muted,var(--color-canvas-subtle,#f6f8fa));--lca-border:var(--borderColor-default,var(--color-border-default,#d1d9e0));--lca-fg:var(--fgColor-default,var(--color-fg-default,#1f2328));--lca-muted:var(--fgColor-muted,var(--color-fg-muted,#59636e));--lca-accent:var(--fgColor-accent,var(--color-accent-fg,#0969da));box-sizing:border-box;font:400 12px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--lca-fg)}
+      .gh-lca-line *,.gh-lca-preview *,.gh-lca-bar *{box-sizing:border-box}
+      .gh-lca-line{display:flex;align-items:center;gap:5px;flex:0 0 calc(100% - 2em);grid-column:1/-1;clear:both;min-width:0;max-width:calc(100% - 2em);margin:2px 0 2px 2em;line-height:24px;white-space:nowrap;text-align:left}
+      .gh-lca-wrap-title{flex-wrap:wrap!important}
+      .gh-lca-line-label{flex:none;color:var(--lca-muted);font-weight:400}
+      .${MARKER}{display:inline-flex;vertical-align:middle;align-items:center;gap:4px;flex:0 1 auto;width:max-content;max-width:100%;min-width:0;min-height:26px;margin:0;padding:1px 2px 1px 6px;border:1px solid var(--lca-border);border-radius:5px;background:var(--lca-bg);white-space:nowrap;text-align:left}
+      .gh-lca-line[hidden],.${MARKER}[hidden],.gh-lca-preview[hidden],.gh-lca-line [hidden],.gh-lca-bar [hidden]{display:none!important}
+      .${MARKER} .gh-lca-main{display:inline-flex;align-items:center;flex:0 1 auto;gap:4px;min-width:0;color:inherit;text-decoration:none!important;font:inherit;outline-offset:2px}
       .${MARKER} .gh-lca-author{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;font-weight:600}
-      .${MARKER} .gh-lca-time{margin-left:auto;color:var(--lca-muted);font-size:11px;flex:none;font-variant-numeric:tabular-nums}
+      .${MARKER} .gh-lca-time{margin-left:0;color:var(--lca-muted);font-size:11px;flex:none;font-variant-numeric:tabular-nums}
       .${MARKER} .gh-lca-prefix{color:var(--lca-muted);flex:none;font-size:11px}
       .${MARKER} img,.${MARKER} .gh-lca-avatar{width:16px;height:16px;flex:none;border-radius:50%;object-fit:cover}
       .${MARKER} .gh-lca-avatar{display:grid;place-items:center;background:var(--lca-muted-bg);color:var(--lca-muted);font-size:10px;font-weight:600}
@@ -720,13 +763,13 @@
       .${MARKER}[data-stale="true"]{border-style:dashed}
       .${MARKER}[data-stale="true"] .gh-lca-flag{color:var(--fgColor-attention,var(--color-attention-fg,#7d4e00))}
       .${MARKER} .gh-lca-action,.gh-lca-bar button,.gh-lca-bar summary{appearance:none;display:inline-flex;align-items:center;justify-content:center;gap:5px;min-height:28px;border:1px solid transparent;border-radius:5px;padding:3px 7px;background:transparent;color:var(--lca-muted);font:inherit;cursor:pointer;text-decoration:none;white-space:nowrap}
-      .${MARKER} .gh-lca-action{flex:none;width:26px;min-height:26px;padding:4px;color:var(--lca-muted)}
+      .${MARKER} .gh-lca-action{flex:none;width:22px;min-height:22px;padding:2px;color:var(--lca-muted)}
       .${MARKER} .gh-lca-action:hover,.gh-lca-bar button:hover,.gh-lca-bar summary:hover{background:var(--lca-muted-bg);color:var(--lca-fg)}
       .${MARKER} a:focus-visible,.${MARKER} button:focus-visible,.gh-lca-bar :is(button,summary,select,input):focus-visible{outline:2px solid var(--lca-accent);outline-offset:2px}
       .${MARKER} button:disabled,.gh-lca-bar button:disabled{cursor:default;opacity:.55}
-      .${MARKER}[data-busy="true"] .gh-lca-action svg{animation:gh-lca-turn 1.3s linear infinite}
+      .${MARKER}[data-busy="true"] .gh-lca-reload svg{animation:gh-lca-turn 1.3s linear infinite}
       @keyframes gh-lca-turn{to{transform:rotate(360deg)}}
-      .gh-lca-bar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px 16px;position:relative;margin:0 0 12px;padding:8px 12px;border:1px solid var(--lca-border);border-radius:6px;background:var(--lca-bg);isolation:isolate}
+      .gh-lca-bar{display:flex;align-items:center;justify-content:flex-start;flex-wrap:wrap;gap:6px 12px;width:max-content;max-width:100%;position:relative;margin:0 0 12px;padding:8px 12px;border:1px solid var(--lca-border);border-radius:6px;background:var(--lca-bg);isolation:isolate}
       .gh-lca-bar .gh-lca-left,.gh-lca-bar .gh-lca-tools{display:flex;align-items:center;flex-wrap:wrap;gap:8px;min-width:0}
       .gh-lca-bar .gh-lca-heading{display:flex;align-items:center;gap:6px;font-weight:600;color:var(--lca-fg);white-space:nowrap}
       .gh-lca-bar .gh-lca-status{color:var(--lca-muted);font-size:11px}
@@ -739,20 +782,29 @@
       .gh-lca-bar .gh-lca-settings input{accent-color:var(--lca-accent);margin:0}
       .gh-lca-bar .gh-lca-settings select{margin-left:auto;background:var(--lca-bg);color:var(--lca-fg);border:1px solid var(--lca-border);border-radius:4px;padding:3px 5px;font:inherit}
       .gh-lca-bar .gh-lca-help{color:var(--lca-muted);font-size:11px;line-height:1.7;border-top:1px solid var(--lca-border);padding-top:10px;margin-top:3px}
-      @media(max-width:700px){.${MARKER}{display:flex;margin-left:0;width:282px;height:34px}.${MARKER} .gh-lca-action{width:30px;min-height:30px}.gh-lca-bar{padding:8px;gap:7px}.gh-lca-bar .gh-lca-tools{margin-left:auto;gap:3px}.gh-lca-bar .gh-lca-left{flex-basis:100%}.gh-lca-bar button,.gh-lca-bar summary{min-height:32px}.gh-lca-bar .gh-lca-settings{position:fixed;top:auto;right:16px;max-height:65vh;overflow:auto}}
+      @media(max-width:700px){.gh-lca-line{gap:4px}.${MARKER} .gh-lca-action{width:24px;min-height:26px}.${MARKER} .gh-lca-flag{max-width:48px;overflow:hidden;text-overflow:ellipsis}.gh-lca-bar{padding:8px;gap:7px}.gh-lca-bar .gh-lca-tools{margin-left:auto;gap:3px}.gh-lca-bar .gh-lca-left{flex-basis:100%}.gh-lca-bar button,.gh-lca-bar summary{min-height:32px}.gh-lca-bar .gh-lca-settings{position:fixed;top:auto;right:16px;max-height:65vh;overflow:auto}}
+      .gh-lca-preview{position:fixed;z-index:10000;display:flex;flex-direction:column;width:520px;max-width:calc(100vw - 24px);max-height:min(440px,calc(100dvh - 24px));padding:0;border:1px solid var(--lca-border);border-radius:8px;background:var(--lca-bg);color:var(--lca-fg);box-shadow:0 8px 28px #0003;overflow:hidden;line-height:1.6}
+      .gh-lca-preview-head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--lca-border);flex:none}
+      .gh-lca-preview-heading{font-weight:600;min-width:0;overflow-wrap:anywhere}
+      .gh-lca-preview-close{margin-left:auto;flex:none;background:transparent;border:0;color:var(--lca-muted);cursor:pointer;font:inherit;font-size:20px;width:28px;height:28px;padding:0;border-radius:4px}
+      .gh-lca-preview-body{margin:0;padding:12px;overflow:auto;overscroll-behavior:contain;min-height:0;white-space:pre-wrap;overflow-wrap:anywhere;tab-size:4;font:400 13px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+      .gh-lca-preview-foot{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;padding:8px 12px;border-top:1px solid var(--lca-border);flex:none;font-size:11px;color:var(--lca-muted)}
+      .gh-lca-preview a{color:var(--lca-accent);white-space:nowrap}
+      .gh-lca-preview :is(button,a,[tabindex]):focus-visible{outline:2px solid var(--lca-accent);outline-offset:-2px}
+      .gh-lca-preview-close:hover{background:var(--lca-muted-bg)}
       @media(prefers-reduced-motion:reduce){.${MARKER} *{animation:none!important;transition:none!important}}
-      @media(forced-colors:active){.${MARKER},.gh-lca-bar{border:1px solid CanvasText}.${MARKER} .gh-lca-flag{outline:1px solid CanvasText}}
+      @media(forced-colors:active){.gh-lca-line,.${MARKER},.gh-lca-preview,.gh-lca-bar{border:1px solid CanvasText}.${MARKER} .gh-lca-flag{outline:1px solid CanvasText}}
     `;
   }
-  const relativeFormatter = new Intl.RelativeTimeFormat('ko', { numeric: 'auto' });
-  function relativeTime(value) {
-    const seconds = (Date.parse(value) - Date.now()) / 1000;
-    if (!Number.isFinite(seconds)) return '';
-    for (const [scale, unit, limit] of [[1, 'second', 60], [60, 'minute', 60], [3600, 'hour', 24],
-      [86400, 'day', 30], [2592000, 'month', 12], [31536000, 'year', Infinity]]) {
-      if (Math.abs(seconds / scale) < limit) return relativeFormatter.format(Math.round(seconds / scale), unit);
-    }
-    return '';
+  const dateFormatter = new Intl.DateTimeFormat('ko-KR', {
+    timeZone: 'Asia/Seoul', year: 'numeric', month: 'numeric', day: 'numeric', weekday: 'short',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  });
+  function calendarDate(value, exact = false) {
+    const date = new Date(value);
+    if (!Number.isFinite(date.getTime())) return '';
+    const p = Object.fromEntries(dateFormatter.formatToParts(date).map(v => [v.type, v.value]));
+    return `${exact ? p.year + '.' : ''}${p.month}.${p.day} (${p.weekday})${exact ? ' ' + p.hour + ':' + p.minute + ' KST' : ''}`;
   }
   function markerKind(result, me) {
     if (result.kind === 'none') return 'none';
@@ -768,7 +820,7 @@
     const kind = result ? markerKind(result, context.me) : record.error ? 'error' : 'loading';
     m.dataset.kind = kind; m.dataset.stale = String(stale); m.dataset.busy = String(busy);
     m.dataset.detail = String(!prefs.compact);
-    m.hidden = result?.kind === 'none' && !prefs.noComments && !stale;
+    record.line.hidden = m.hidden = result?.kind === 'none' && !prefs.noComments && !stale;
     m.setAttribute('aria-busy', String(busy));
     const contentKey = JSON.stringify([result, kind, prefs.avatars, prefs.compact]);
     if (record.contentKey !== contentKey) {
@@ -787,9 +839,8 @@
             image.addEventListener('error', () => image.replaceWith(fallback), { once: true }); primary.append(image);
           } else primary.append(fallback);
         }
-        if (!prefs.compact) primary.append(textNode('span', 'gh-lca-prefix', '마지막 댓글'));
         primary.append(textNode('span', 'gh-lca-author', result.author ? `@${result.author}` : '작성자 정보 없음'));
-        record.timeEl = textNode('span', 'gh-lca-time', relativeTime(result.time)); primary.append(record.timeEl);
+        record.timeEl = textNode('span', 'gh-lca-time', calendarDate(result.time)); primary.append(record.timeEl);
       } else {
         record.timeEl = null; primary.append(icon('comment'));
         primary.append(textNode('span', 'gh-lca-label', ''));
@@ -797,10 +848,10 @@
       record.primary.replaceWith(primary); record.primary = primary;
     }
     if (result?.kind === 'comment') {
-      if (record.timeEl) setText(record.timeEl, relativeTime(result.time));
+      if (record.timeEl) setText(record.timeEl, calendarDate(result.time));
       const meaning = kind === 'mine' ? '내가 쓴 댓글' : kind === 'mention' ? '본문에 내 아이디가 있어. 실제 알림 전송 여부는 확인하지 않아' : kind === 'bot' ? '봇이 쓴 댓글' : '다른 사람이 쓴 댓글';
-      const title = `${stale ? '이전 조회 결과야. 최신 댓글은 아직 확인하지 못했어.\n' : ''}${meaning}\n작성자: ${result.author ? '@' + result.author : '작성자 정보 없음'}\n작성: ${new Date(result.time).toLocaleString('ko-KR')}\n확인: ${new Date(record.at).toLocaleString('ko-KR')}\n클릭하면 이 일반 댓글로 이동해${record.error ? `\n${record.error.message}` : ''}`;
-      record.primary.title = title; record.primary.setAttribute('aria-label', title.replace(/\n/g, '. '));
+      const title = `${stale ? '이전 조회 결과야. 최신 댓글은 아직 확인하지 못했어.\n' : ''}${meaning}\n작성자: ${result.author ? '@' + result.author : '작성자 정보 없음'}\n작성: ${calendarDate(result.time, true)}\n확인: ${calendarDate(record.at, true)}\n클릭하면 이 일반 댓글로 이동해${record.error ? `\n${record.error.message}` : ''}`;
+      record.primary.removeAttribute('title'); record.primary.setAttribute('aria-label', title.replace(/\n/g, '. ') + '. 마우스 또는 키보드 포커스로 본문 미리보기');
     } else {
       const label = result?.kind === 'none' ? '댓글 없음' : record.error ? (record.error.code === 'RATE_LIMIT' ? '잠시 조회 제한' : '조회 실패') : busy ? '댓글 확인 중…' : userPaused ? '조회 일시정지' : navigator.onLine === false ? '오프라인' : '댓글 확인 대기';
       setText(record.primary.querySelector('.gh-lca-label'), label);
@@ -811,8 +862,180 @@
     record.action.disabled = busy || waiting || userPaused || limited || navigator.onLine === false;
     const actionLabel = busy ? '댓글 확인 중' : waiting ? '조회 순서를 기다리는 중' : limited ? 'GitHub 조회 제한이 끝나면 다시 시도해' : record.error ? '마지막 댓글 다시 조회' : '이 이슈의 마지막 댓글 새로 조회';
     record.action.title = actionLabel; record.action.setAttribute('aria-label', actionLabel);
+    record.previewButton.hidden = result?.kind !== 'comment';
+    if (record.timeEl) record.timeEl.title = calendarDate(result.time, true);
+    if (record.primary.tagName === 'A') {
+      record.primary.setAttribute('aria-controls', PREVIEW_ID);
+      record.primary.setAttribute('aria-expanded', String(preview.record === record));
+    }
+    if (preview.record === record) updatePreview(record);
     updateToolbarSoon();
   }
+
+  const layoutHosts = new WeakMap();
+  function releaseLayout(record) {
+    const host = record.layoutHost, users = host && layoutHosts.get(host);
+    if (users) { users.delete(record); if (!users.size) { host.classList.remove('gh-lca-wrap-title'); layoutHosts.delete(host); } }
+    record.layoutHost = null;
+  }
+  function mountLine(record) {
+    releaseLayout(record);
+    const link = record.link;
+    let anchor = link.closest('h1,h2,h3,h4,h5,h6,[role="heading"],[data-testid="list-view-item-title-container"],[data-testid="issue-title-container"]') || link;
+    if (!record.row.contains(anchor)) anchor = link;
+    // Inline title wrappers cannot force a line break in an outer flex row. Place after that wrapper instead.
+    while (anchor.parentElement && anchor.parentElement !== record.row && getComputedStyle(anchor.parentElement).display === 'inline') anchor = anchor.parentElement;
+    // Keep label chips beside the title; never move GitHub/React's own nodes.
+    while (anchor.nextElementSibling?.matches('.Label,[data-testid="issue-label"],[data-testid="label"]')) anchor = anchor.nextElementSibling;
+    const host = anchor.parentElement;
+    if (host && ['flex', 'inline-flex'].includes(getComputedStyle(host).display) && !getComputedStyle(host).flexDirection.startsWith('column')) {
+      let users = layoutHosts.get(host); if (!users) layoutHosts.set(host, users = new Set());
+      users.add(record); host.classList.add('gh-lca-wrap-title'); record.layoutHost = host;
+    }
+    record.titleAnchor = anchor;
+    anchor.insertAdjacentElement('afterend', record.line);
+    if (record.marker.parentElement !== record.line) record.line.append(record.marker);
+  }
+
+  const PREVIEW_ID = 'gh-lca-comment-preview';
+  const preview = { panel: null, record: null, openTimer: null, closeTimer: null, positionFrame: null, requested: false, dismissed: null, suppressHover: false, pointer: null, hovered: null };
+  function ensurePreview() {
+    if (preview.panel?.isConnected) return preview.panel;
+    const panel = textNode('section', 'gh-lca-preview'); panel.id = PREVIEW_ID; panel.hidden = true; panel.setAttribute(OWN, '');
+    panel.setAttribute('role', 'region'); panel.setAttribute('aria-label', '마지막 댓글 본문 미리보기');
+    const head = textNode('div', 'gh-lca-preview-head'), heading = textNode('span', 'gh-lca-preview-heading');
+    const close = textNode('button', 'gh-lca-preview-close', '×'); close.type = 'button'; close.setAttribute('aria-label', '댓글 미리보기 닫기');
+    close.addEventListener('click', () => closePreview(true)); head.append(heading, close);
+    const body = textNode('div', 'gh-lca-preview-body'); body.tabIndex = 0; body.setAttribute('aria-label', '댓글 본문, 긴 댓글은 스크롤');
+    const foot = textNode('div', 'gh-lca-preview-foot'), note = textNode('span', 'gh-lca-preview-note');
+    const open = textNode('a', 'gh-lca-preview-open', '댓글 열기 ↗'); open.target = '_blank'; open.rel = 'noopener noreferrer';
+    foot.append(note, open); panel.append(head, body, foot);
+    panel.addEventListener('pointerenter', () => clearTimeout(preview.closeTimer));
+    panel.addEventListener('pointerleave', () => schedulePreviewClose());
+    panel.addEventListener('focusin', () => clearTimeout(preview.closeTimer));
+    panel.addEventListener('focusout', () => schedulePreviewClose());
+    // Do not leak popup clicks to GitHub's row navigation.
+    panel.addEventListener('click', event => event.stopPropagation());
+    document.body.append(panel); preview.panel = panel; return panel;
+  }
+  function schedulePreviewClose() {
+    clearTimeout(preview.openTimer); clearTimeout(preview.closeTimer);
+    preview.closeTimer = setTimeout(() => {
+      const record = preview.record, panel = preview.panel;
+      if (panel?.matches(':hover') || panel?.contains(document.activeElement) || record?.marker.matches(':hover') || record?.marker.contains(document.activeElement)) return;
+      closePreview();
+    }, 230);
+  }
+  function closePreview(dismiss = false) {
+    clearTimeout(preview.openTimer); clearTimeout(preview.closeTimer);
+    if (preview.positionFrame !== null) cancelAnimationFrame(preview.positionFrame);
+    preview.positionFrame = null;
+    const record = preview.record, hadFocus = preview.panel?.contains(document.activeElement);
+    preview.record = null; preview.requested = false;
+    if (dismiss) { preview.dismissed = record; preview.suppressHover = true; }
+    if (preview.panel) { preview.panel.hidden = true; preview.panel.querySelector('.gh-lca-preview-body').textContent = ''; }
+    if (record) {
+      record.primary.setAttribute('aria-expanded', 'false'); record.previewButton.setAttribute('aria-expanded', 'false');
+      if (dismiss && hadFocus && record.previewButton.isConnected) record.previewButton.focus({ preventScroll: true });
+    }
+  }
+  function openPreview(record, explicit = false) {
+    clearTimeout(preview.openTimer); clearTimeout(preview.closeTimer);
+    if (record.value?.kind !== 'comment' || !record.line.isConnected || context.identity !== identity()) return;
+    if (explicit) { preview.dismissed = null; preview.suppressHover = false; }
+    if (preview.dismissed === record) return;
+    if (preview.record !== record) { closePreview(); preview.record = record; preview.requested = false; }
+    const panel = ensurePreview(); panel.hidden = false;
+    record.primary.setAttribute('aria-expanded', 'true'); record.previewButton.setAttribute('aria-expanded', 'true');
+    updatePreview(record);
+    // A sessionStorage cache hit has author/date but no body. Reuse the normal bounded issue queue once.
+    if (!getPreview(record) && !preview.requested && !record.error && networkAllowed()) {
+      preview.requested = true; enqueue(record, true);
+    }
+  }
+  function positionPreview() {
+    preview.positionFrame = null;
+    const panel = preview.panel, record = preview.record;
+    if (!panel || panel.hidden || !record?.line.isConnected) return;
+    const viewport = window.visualViewport;
+    const leftEdge = viewport?.offsetLeft || 0, topEdge = viewport?.offsetTop || 0;
+    const width = viewport?.width || innerWidth, height = viewport?.height || innerHeight;
+    panel.style.width = `${Math.min(520, width - 24)}px`;
+    panel.style.maxHeight = `${Math.min(440, height - 24)}px`;
+    const anchor = record.marker.getBoundingClientRect(), rect = panel.getBoundingClientRect();
+    const left = Math.max(leftEdge + 12, Math.min(anchor.left, leftEdge + width - rect.width - 12));
+    const below = anchor.bottom + 6, above = anchor.top - rect.height - 6;
+    const top = below + rect.height <= topEdge + height - 12 ? below : above >= topEdge + 12 ? above : Math.max(topEdge + 12, topEdge + height - rect.height - 12);
+    panel.style.left = `${left}px`; panel.style.top = `${top}px`;
+  }
+  function positionPreviewSoon() {
+    if (preview.positionFrame === null) preview.positionFrame = requestAnimationFrame(positionPreview);
+  }
+  function updatePreview(record) {
+    const panel = preview.panel;
+    if (preview.record !== record || !panel || panel.hidden) return;
+    if (record.value?.kind !== 'comment') { closePreview(); return; }
+    const entry = getPreview(record), value = record.value;
+    setText(panel.querySelector('.gh-lca-preview-heading'), `${value.author ? '@' + value.author : '작성자 정보 없음'} · ${calendarDate(value.time, true)}`);
+    const busy = record.state === 'loading' || record.state === 'queued';
+    const stale = Date.now() >= record.freshUntil || !!record.error || record.forced;
+    let body, note;
+    if (entry) {
+      body = entry.available ? entry.text || '텍스트 본문이 비어 있어.' : '이 응답에는 댓글 본문이 없어서 미리 볼 수 없어. 아래에서 댓글을 열어줘.';
+      note = `${stale ? '이전 조회 결과 · ' : ''}${entry.truncated ? '앞 16,000자만 표시 · ' : ''}텍스트 미리보기`;
+      if (record.error) note += ' · 새 조회 실패';
+    } else {
+      body = record.error ? `${record.error.message}\n배지의 새로고침 버튼으로 다시 시도해.` : !networkAllowed() ? '조회가 멈춰 있어. 조회를 재개하거나 네트워크 연결을 확인해.' : '댓글 본문을 불러오는 중…';
+      note = '본문은 이 페이지의 메모리에만 보관해';
+    }
+    const bodyNode = panel.querySelector('.gh-lca-preview-body');
+    setText(bodyNode, body); bodyNode.setAttribute('aria-busy', String(busy && !entry));
+    setText(panel.querySelector('.gh-lca-preview-note'), note);
+    panel.querySelector('.gh-lca-preview-open').href = value.commentUrl;
+    positionPreviewSoon();
+  }
+  function bindPreview(record) {
+    record.marker.addEventListener('pointerenter', event => {
+      if (event.pointerType === 'touch') return;
+      preview.hovered = record;
+      if (preview.suppressHover) return;
+      clearTimeout(preview.closeTimer); clearTimeout(preview.openTimer);
+      if (preview.dismissed === record) return;
+      preview.openTimer = setTimeout(() => openPreview(record), 180);
+    });
+    record.marker.addEventListener('pointerleave', () => { if (preview.hovered === record) preview.hovered = null; if (preview.dismissed === record) preview.dismissed = null; schedulePreviewClose(); });
+    record.marker.addEventListener('focusin', event => { if (event.target !== record.action) openPreview(record); });
+    record.marker.addEventListener('focusout', () => { if (preview.dismissed === record) preview.dismissed = null; schedulePreviewClose(); });
+    record.marker.addEventListener('keydown', event => {
+      if (event.key === 'ArrowDown' && record.value?.kind === 'comment') {
+        event.preventDefault(); event.stopPropagation(); openPreview(record, true); preview.panel?.querySelector('.gh-lca-preview-body').focus();
+      }
+    });
+    record.previewButton.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); openPreview(record, true); });
+  }
+  document.addEventListener('pointermove', event => {
+    const old = preview.pointer; preview.pointer = { x: event.clientX, y: event.clientY };
+    if (preview.suppressHover && old && (old.x !== event.clientX || old.y !== event.clientY)) {
+      preview.suppressHover = false;
+      const hovered = preview.hovered;
+      if (hovered?.marker.matches(':hover')) {
+        clearTimeout(preview.openTimer); preview.openTimer = setTimeout(() => openPreview(hovered), 180);
+      }
+    }
+  }, { passive: true });
+  document.addEventListener('keydown', event => { if (event.key === 'Escape' && preview.record) { closePreview(true); event.stopPropagation(); } }, true);
+  document.addEventListener('pointerdown', event => {
+    if (preview.record && !preview.panel?.contains(event.target) && !preview.record.marker.contains(event.target)) closePreview(true);
+  }, true);
+  document.addEventListener('scroll', event => {
+    if (preview.record && !preview.panel?.contains(event.target)) {
+      const rect = preview.record.marker.getBoundingClientRect();
+      if (rect.bottom < 0 || rect.top > innerHeight) closePreview();
+      else positionPreviewSoon();
+    }
+  }, true);
+  window.addEventListener('resize', () => { if (preview.record) positionPreviewSoon(); });
+  window.visualViewport?.addEventListener('resize', () => { if (preview.record) positionPreviewSoon(); });
 
   let context = { identity: '', me: '', controller: new AbortController() };
   const records = new Map(), recordQueue = new Set(), jobs = new Map();
@@ -822,16 +1045,21 @@
   const identity = () => `${location.pathname}${location.search}|${currentLogin().toLowerCase()}`;
   function activeRecords() { return [...records.values()].filter(r => r.link.isConnected); }
   function makeRecord(item, signature) {
+    const line = textNode('span', 'gh-lca-line'); line.setAttribute(OWN, '');
     const marker = textNode('span', MARKER); marker.setAttribute(OWN, '');
+    line.append(textNode('span', 'gh-lca-line-label', '마지막 댓글 :'), marker);
     const primary = textNode('span', 'gh-lca-main'), flag = textNode('span', 'gh-lca-flag');
-    const action = document.createElement('button'); action.type = 'button'; action.className = 'gh-lca-action'; action.append(icon('refresh'));
-    marker.append(primary, flag, action);
-    const record = { ...item, marker, primary, flag, action, signature, version: 1, state: 'new',
+    const action = document.createElement('button'); action.type = 'button'; action.className = 'gh-lca-action gh-lca-reload'; action.append(icon('refresh'));
+    const previewButton = document.createElement('button'); previewButton.type = 'button'; previewButton.className = 'gh-lca-action gh-lca-peek';
+    previewButton.append(icon('comment')); previewButton.setAttribute('aria-label', '마지막 댓글 본문 미리보기');
+    previewButton.setAttribute('aria-controls', PREVIEW_ID); previewButton.setAttribute('aria-expanded', 'false');
+    marker.append(primary, flag, previewButton, action);
+    const record = { ...item, line, marker, primary, flag, action, previewButton, signature, version: 1, state: 'new',
       freshUntil: 0, lastAttempt: 0, near: !nearObserver, inView: !viewObserver, value: null, at: 0, error: null, forced: false, job: null };
     action.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); enqueue(record, true); });
     records.set(item.link, record);
     let set = rowRecords.get(item.row); if (!set) rowRecords.set(item.row, set = new Set()); set.add(record);
-    item.link.insertAdjacentElement('afterend', marker);
+    mountLine(record); bindPreview(record);
     // DOM에 추가한 직후 동기 레이아웃 계산을 하지 않는다. 가시성 판정은 Observer에 맡긴다.
     nearObserver?.observe(item.link); viewObserver?.observe(item.link);
     const cached = getCache(item.info, signature, context.me, true);
@@ -843,7 +1071,8 @@
     record.job?.subscribers.delete(record);
     if (record.job && !record.job.subscribers.size) record.job.controller.abort();
     nearObserver?.unobserve(record.link); viewObserver?.unobserve(record.link);
-    record.marker.remove(); records.delete(record.link); rowRecords.get(record.row)?.delete(record);
+    if (preview.record === record) closePreview();
+    releaseLayout(record); record.line.remove(); records.delete(record.link); rowRecords.get(record.row)?.delete(record);
   }
   function applyEntry(record, entry) {
     record.value = entry.value; record.at = entry.at; record.freshUntil = entry.at + ttlFor(entry.value);
@@ -860,6 +1089,7 @@
     clearTimeout(pumpTimer);
   }
   function resetContext(clearCache = false) {
+    closePreview(); previewCache.clear();
     context.controller.abort(); cancelJobs();
     for (const record of [...records.values()]) removeRecord(record);
     rowRecords = new WeakMap(); dirtyRoots.clear();
@@ -984,7 +1214,7 @@
     const details = document.createElement('details'), summary = document.createElement('summary');
     summary.append(icon('settings'), document.createTextNode('표시')); summary.setAttribute('aria-label', '마지막 댓글 표시 설정');
     const panel = textNode('div', 'gh-lca-settings');
-    for (const [key, text] of [['compact', '간결하게 표시'], ['avatars', '작성자 아바타 표시'], ['noComments', '댓글 없음도 표시']]) {
+    for (const [key, text] of [['avatars', '작성자 아바타 표시'], ['noComments', '댓글 없음도 표시']]) {
       const label = document.createElement('label'), input = document.createElement('input'); input.type = 'checkbox'; input.checked = prefs[key]; input.dataset.pref = key;
       input.addEventListener('change', () => { prefs[key] = input.checked; savePrefs(); for (const r of records.values()) paint(r); });
       label.append(input, document.createTextNode(text)); panel.append(label);
@@ -1071,7 +1301,7 @@
         removeRecord(record); record = null;
       }
       if (!record) record = makeRecord(item, signature);
-      else if (!record.marker.isConnected || record.marker.parentElement !== record.link.parentElement) record.link.insertAdjacentElement('afterend', record.marker);
+      else if (!record.line.isConnected || !record.marker.isConnected || record.line.previousElementSibling !== record.titleAnchor) mountLine(record);
       if (record.near) enqueue(record);
     }
     ensureToolbar(); startMaintenance();
@@ -1082,7 +1312,13 @@
     let changed = false;
     for (const mutation of mutations) {
       const target = mutation.target.nodeType === 1 ? mutation.target : mutation.target.parentElement;
-      if (!target || target.closest?.(`[${OWN}]`)) continue;
+      if (!target) continue;
+      if (target.closest?.(`[${OWN}]`)) {
+        if (target.classList.contains('gh-lca-line') && [...(mutation.removedNodes || [])].some(n => n.nodeType === 1 && n.classList.contains(MARKER))) {
+          const row = target.closest(ROW_SELECTOR); if (row) scheduleScan(row);
+        }
+        continue;
+      }
       if (mutation.type === 'attributes' && target.matches('meta[name="user-login"]')) { scheduleScan(); return; }
       const candidates = [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])];
       // 자기 UI 추가·변경은 무시하되 외부에서 지운 배지는 복구한다.
@@ -1092,7 +1328,7 @@
       for (const node of candidates) {
         if (node.nodeType !== 1) continue;
         if (node.hasAttribute(OWN)) {
-          if (!node.isConnected && (node === toolbar || node.classList.contains(MARKER))) {
+          if (!node.isConnected && (node === toolbar || node.classList.contains(MARKER) || node.classList.contains('gh-lca-line'))) {
             if (row) dirtyRoots.add(row); else ensureToolbar(); changed = true;
           }
           continue;
@@ -1132,7 +1368,7 @@
   }
   function visibilityChanged() {
     if (document.visibilityState === 'hidden') {
-      clearTimeout(maintenanceTimer); clearTimeout(scanTimer); cancelJobs();
+      closePreview(); clearTimeout(maintenanceTimer); clearTimeout(scanTimer); cancelJobs();
     } else {
       if (context.identity !== identity()) navigationChanged();
       else { if (fullScanWanted || dirtyRoots.size || cleanupWanted) scheduleScan(); else maintain(); }
@@ -1165,7 +1401,7 @@
   window.addEventListener('popstate', navigationChanged);
   window.addEventListener('online', () => { maintain(); pump(); });
   window.addEventListener('offline', () => { cancelJobs(); for (const r of records.values()) paint(r); updateToolbar(); });
-  window.addEventListener('pagehide', () => { cancelJobs(); clearTimeout(maintenanceTimer); });
+  window.addEventListener('pagehide', () => { closePreview(); previewCache.clear(); cancelJobs(); clearTimeout(maintenanceTimer); });
   window.addEventListener('pageshow', event => { if (event.persisted) navigationChanged(); });
   // Chromium의 pushState/replaceState도 잡는다. 지원하지 않는 환경은 GitHub 내비게이션 이벤트와 DOM 관찰을 사용한다.
   if (window.navigation?.addEventListener) window.navigation.addEventListener('currententrychange', navigationChanged);
