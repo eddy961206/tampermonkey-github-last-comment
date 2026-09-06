@@ -9,12 +9,14 @@ GitHub 이슈/PR 목록에서 각 글의 **마지막 댓글 작성자 + 상대�
    - https://raw.githubusercontent.com/eddy961206/tampermonkey-github-last-comment/main/github-last-comment.user.js
 3. 이후 `// @version` 이 올라가면 Tampermonkey가 자동 업데이트로 감지함 (`@updateURL` / `@downloadURL` 설정됨)
 
-## 적용 페이지
+## 적용 페이지 (v1.4)
 
-- `https://github.com/*/*/issues*`
-- `https://github.com/issues*`
-- `https://github.com/pulls*`
-- `https://github.com/search*`
+- `https://github.com/*` (스크립트 내부에서 이슈/PR 목록 화면만 처리, `@noframes`)
+
+## 변경 내역
+
+- v1.4.0: 생략 구간 최대 50개씩 반복 조회·검증, 일반 댓글만 판별(updatedAt 대체 금지), 실패를 '댓글 없음'으로 표시하지 않음, 동시 요청 2개·15초 제한, 캐시 2분·계정별 분리, 진단 로그 메뉴 추가
+- v1.3.0: 최초 버전관리본
 
 ## 버전 관리 규칙
 
