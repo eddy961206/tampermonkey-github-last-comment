@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub 이슈 목록 - 마지막 댓글 작성자
 // @namespace    https://github.com/
-// @version      1.7.0
+// @version      1.7.1
 // @description  제목 아래 마지막 댓글 작성자·날짜·요일·오전/오후 시각과 안전한 마크다운 본문 미리보기를 표시한다.
 // @match        https://github.com/*
 // @icon         https://github.githubassets.com/favicons/favicon.svg
@@ -16,7 +16,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.7.0';
+  const VERSION = '1.7.1';
   const CONFIG = Object.freeze({
     cacheMinutes: 2,
     noCommentCacheSeconds: 60,
@@ -883,15 +883,24 @@
       .gh-lca-bar .gh-lca-heading{display:flex;align-items:center;gap:6px;font-weight:600;color:var(--lca-fg);white-space:nowrap}
       .gh-lca-bar .gh-lca-status{color:var(--lca-muted);font-size:11px}
       .gh-lca-bar button[aria-pressed="true"]{border-color:var(--lca-border);background:var(--lca-muted-bg);color:var(--lca-fg)}
-      .gh-lca-bar details{position:relative}
-      .gh-lca-bar summary{list-style:none}
-      .gh-lca-bar summary::-webkit-details-marker{display:none}
-      .gh-lca-bar .gh-lca-settings{position:absolute;right:0;top:calc(100% + 8px);z-index:30;width:260px;max-width:calc(100vw - 32px);padding:14px;border:1px solid var(--lca-border);border-radius:8px;background:var(--lca-bg);box-shadow:0 8px 24px #0002;color:var(--lca-fg);white-space:normal}
-      .gh-lca-bar .gh-lca-settings label{display:flex;align-items:center;gap:8px;margin:0 0 12px;cursor:pointer}
-      .gh-lca-bar .gh-lca-settings input{accent-color:var(--lca-accent);margin:0}
-      .gh-lca-bar .gh-lca-settings select{margin-left:auto;background:var(--lca-bg);color:var(--lca-fg);border:1px solid var(--lca-border);border-radius:4px;padding:3px 5px;font:inherit}
-      .gh-lca-bar .gh-lca-help{color:var(--lca-muted);font-size:11px;line-height:1.7;border-top:1px solid var(--lca-border);padding-top:10px;margin-top:3px}
-      @media(max-width:700px){.gh-lca-line{gap:4px}.${MARKER} .gh-lca-action{width:24px;min-height:26px}.${MARKER} .gh-lca-flag{max-width:48px;overflow:hidden;text-overflow:ellipsis}.gh-lca-bar{padding:8px;gap:7px}.gh-lca-bar .gh-lca-tools{margin-left:auto;gap:3px}.gh-lca-bar .gh-lca-left{flex-basis:100%}.gh-lca-bar button,.gh-lca-bar summary{min-height:32px}.gh-lca-bar .gh-lca-settings{position:fixed;top:auto;right:16px;max-height:65vh;overflow:auto}}
+      @media(max-width:700px){.gh-lca-line{gap:4px}.${MARKER} .gh-lca-action{width:24px;min-height:26px}.${MARKER} .gh-lca-flag{max-width:48px;overflow:hidden;text-overflow:ellipsis}.gh-lca-bar{padding:8px;gap:7px}.gh-lca-bar .gh-lca-tools{margin-left:auto;gap:3px}.gh-lca-bar .gh-lca-left{flex-basis:100%}.gh-lca-bar button,.gh-lca-bar summary{min-height:32px}}
+      /* An independent opaque surface: do not inherit a transparent canvas token. */
+      #gh-lca-display-settings{--lca-settings-bg:#ffffff;--lca-settings-muted-bg:#f6f8fa;--lca-settings-fg:#1f2328;--lca-settings-muted:#59636e;--lca-settings-border:#d1d9e0;--lca-settings-accent:#0969da;position:fixed!important;inset:auto;margin:0!important;z-index:2147483647;box-sizing:border-box;width:280px;max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px);overflow:auto;overscroll-behavior:contain;padding:14px;border:1px solid var(--lca-settings-border);border-radius:8px;background:var(--lca-settings-bg,#fff)!important;color:var(--lca-settings-fg,#1f2328)!important;opacity:1!important;filter:none!important;backdrop-filter:none!important;mix-blend-mode:normal;box-shadow:0 8px 28px #0003;font:400 12px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;white-space:normal;text-align:left;color-scheme:light}
+      #gh-lca-display-settings[hidden]{display:none!important}
+      #gh-lca-display-settings::backdrop{background:transparent;pointer-events:none}
+      #gh-lca-display-settings *{box-sizing:border-box}
+      #gh-lca-display-settings .gh-lca-settings-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 12px;font-weight:600}
+      #gh-lca-display-settings label{display:flex;align-items:center;gap:8px;margin:0 0 12px;cursor:pointer;color:inherit}
+      #gh-lca-display-settings input{accent-color:var(--lca-settings-accent);margin:0;flex:none}
+      #gh-lca-display-settings select{margin-left:auto;background:var(--lca-settings-bg);color:inherit;border:1px solid var(--lca-settings-border);border-radius:4px;padding:4px 6px;font:inherit}
+      #gh-lca-display-settings .gh-lca-help{color:var(--lca-settings-muted);font-size:11px;line-height:1.7;border-top:1px solid var(--lca-settings-border);padding-top:10px;margin:3px 0 8px}
+      #gh-lca-display-settings button{appearance:none;display:inline-flex;align-items:center;justify-content:center;min-height:28px;padding:3px 7px;border:1px solid var(--lca-settings-border);border-radius:5px;background:var(--lca-settings-bg);color:inherit;font:inherit;cursor:pointer}
+      #gh-lca-display-settings .gh-lca-settings-close{width:28px;padding:0;border-color:transparent;font-size:18px}
+      #gh-lca-display-settings button:hover{background:var(--lca-settings-muted-bg)}
+      #gh-lca-display-settings :is(button,select,input):focus-visible{outline:2px solid var(--lca-settings-accent);outline-offset:2px}
+      html[data-color-mode="dark"] #gh-lca-display-settings{--lca-settings-bg:#161b22;--lca-settings-muted-bg:#21262d;--lca-settings-fg:#f0f6fc;--lca-settings-muted:#9198a1;--lca-settings-border:#3d444d;--lca-settings-accent:#4493f8;color-scheme:dark}
+      @media(prefers-color-scheme:dark){html:not([data-color-mode="light"]):not([data-color-mode="dark"]) #gh-lca-display-settings{--lca-settings-bg:#161b22;--lca-settings-muted-bg:#21262d;--lca-settings-fg:#f0f6fc;--lca-settings-muted:#9198a1;--lca-settings-border:#3d444d;--lca-settings-accent:#4493f8;color-scheme:dark}}
+      @media(forced-colors:active){#gh-lca-display-settings{background:Canvas!important;color:CanvasText!important;border-color:CanvasText}#gh-lca-display-settings :is(button,select){background:Canvas;color:CanvasText;border-color:CanvasText}#gh-lca-display-settings .gh-lca-help{color:CanvasText}}
       .gh-lca-preview{position:fixed;z-index:10000;display:flex;flex-direction:column;width:520px;max-width:calc(100vw - 24px);max-height:min(440px,calc(100dvh - 24px));padding:0;border:1px solid var(--lca-border);border-radius:8px;background:var(--lca-bg);color:var(--lca-fg);box-shadow:0 8px 28px #0003;overflow:hidden;line-height:1.6}
       .gh-lca-preview-head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--lca-border);flex:none}
       .gh-lca-preview-heading{font-weight:600;min-width:0;overflow-wrap:anywhere}
@@ -1079,6 +1088,7 @@
     }
   }
   function openPreview(record, explicit = false) {
+    if (settingsPopup.panel && !settingsPopup.panel.hidden) return;
     clearTimeout(preview.openTimer); clearTimeout(preview.closeTimer);
     if (record.value?.kind !== 'comment' || !record.line.isConnected || context.identity !== identity()) return;
     if (explicit) { preview.dismissed = null; preview.suppressHover = false; }
@@ -1241,6 +1251,7 @@
     clearTimeout(pumpTimer);
   }
   function resetContext(clearCache = false) {
+    disposeSettings();
     closePreview(); previewCache.clear(); renderedPreviewCache.clear();
     context.controller.abort(); cancelJobs();
     for (const record of [...records.values()]) removeRecord(record);
@@ -1347,10 +1358,98 @@
     queueMicrotask(pumpJobs);
   }) : null;
 
+  const SETTINGS_ID = 'gh-lca-display-settings';
+  const settingsPopup = { panel: null, button: null, frame: null, listeners: null, resize: null };
+  function positionSettings() {
+    settingsPopup.frame = null;
+    const { panel, button } = settingsPopup;
+    if (!panel || panel.hidden) return;
+    if (!button?.isConnected || !panel.isConnected) { disposeSettings(); return; }
+    const viewport = window.visualViewport;
+    const x = viewport?.offsetLeft || 0, y = viewport?.offsetTop || 0;
+    const width = viewport?.width || innerWidth, height = viewport?.height || innerHeight;
+    const anchor = button.getBoundingClientRect(), gap = 8, margin = 12;
+    if (anchor.bottom < y || anchor.top > y + height || anchor.right < x || anchor.left > x + width) {
+      closeSettings(); return;
+    }
+    panel.style.width = `${Math.max(1, Math.min(280, width - margin * 2))}px`;
+    panel.style.maxHeight = `${Math.max(1, height - margin * 2)}px`;
+    const rect = panel.getBoundingClientRect();
+    const below = anchor.bottom + gap, above = anchor.top - rect.height - gap;
+    const top = below + rect.height <= y + height - margin ? below : above >= y + margin ? above :
+      Math.max(y + margin, Math.min(below, y + height - rect.height - margin));
+    panel.style.left = `${Math.max(x + margin, Math.min(anchor.right - rect.width, x + width - rect.width - margin))}px`;
+    panel.style.top = `${top}px`;
+  }
+  function positionSettingsSoon() {
+    if (settingsPopup.panel && !settingsPopup.panel.hidden && settingsPopup.frame === null) {
+      settingsPopup.frame = requestAnimationFrame(positionSettings);
+    }
+  }
+  function closeSettings(restoreFocus = false, alreadyClosed = false) {
+    const { panel, button } = settingsPopup;
+    settingsPopup.listeners?.abort(); settingsPopup.listeners = null;
+    settingsPopup.resize?.disconnect(); settingsPopup.resize = null;
+    if (settingsPopup.frame !== null) cancelAnimationFrame(settingsPopup.frame);
+    settingsPopup.frame = null;
+    if (panel) {
+      if (!alreadyClosed && panel.hasAttribute('popover')) {
+        try { if (panel.matches(':popover-open')) panel.hidePopover(); } catch {}
+      }
+      panel.hidden = true;
+    }
+    button?.setAttribute('aria-expanded', 'false');
+    if (restoreFocus && button?.isConnected) button.focus({ preventScroll: true });
+  }
+  function disposeSettings() {
+    closeSettings(); settingsPopup.panel?.remove();
+    settingsPopup.panel = null; settingsPopup.button = null;
+  }
+  function openSettings() {
+    const { panel, button } = settingsPopup;
+    if (!panel?.isConnected || !button?.isConnected) return;
+    if (!panel.hidden) { closeSettings(true); return; }
+    closePreview(true);
+    panel.hidden = false;
+    // Top-layer popovers escape the toolbar's isolation, clipping and transforms.
+    // Unsupported browsers use the same body portal with a high stacking level.
+    if (typeof panel.showPopover === 'function') {
+      panel.setAttribute('popover', 'auto');
+      try { panel.showPopover({ source: button }); panel.dataset.layer = 'top'; }
+      catch { panel.removeAttribute('popover'); panel.dataset.layer = 'fallback'; }
+    } else { panel.removeAttribute('popover'); panel.dataset.layer = 'fallback'; }
+    button.setAttribute('aria-expanded', 'true');
+    positionSettings();
+    const listeners = new AbortController(); settingsPopup.listeners = listeners;
+    const signal = listeners.signal;
+    document.addEventListener('scroll', event => { if (!panel.contains(event.target)) positionSettingsSoon(); }, { capture: true, passive: true, signal });
+    window.addEventListener('resize', positionSettingsSoon, { passive: true, signal });
+    window.visualViewport?.addEventListener('resize', positionSettingsSoon, { passive: true, signal });
+    window.visualViewport?.addEventListener('scroll', positionSettingsSoon, { passive: true, signal });
+    document.addEventListener('pointerdown', event => {
+      if (panel.dataset.layer === 'fallback' && !panel.contains(event.target) && !button.contains(event.target)) closeSettings();
+    }, { capture: true, signal });
+    document.addEventListener('keydown', event => {
+      // Native popovers handle Escape themselves, including an open select picker.
+      if (event.key === 'Escape' && panel.dataset.layer === 'fallback') {
+        event.preventDefault(); event.stopPropagation(); closeSettings(true);
+      }
+    }, { signal });
+    document.addEventListener('focusin', event => {
+      if (!panel.contains(event.target) && !button.contains(event.target)) closeSettings();
+    }, { signal });
+    if (typeof ResizeObserver === 'function') {
+      settingsPopup.resize = new ResizeObserver(positionSettingsSoon);
+      settingsPopup.resize.observe(button);
+    }
+    panel.querySelector('input, select, button')?.focus({ preventScroll: true });
+  }
+
   function ensureToolbar() {
     const first = records.values().next().value;
-    if (!first) { toolbar?.remove(); toolbar = null; return; }
+    if (!first) { disposeSettings(); toolbar?.remove(); toolbar = null; return; }
     if (toolbar?.isConnected) return;
+    disposeSettings();
     toolbar = textNode('div', 'gh-lca-bar'); toolbar.setAttribute(OWN, ''); toolbar.setAttribute('role', 'region'); toolbar.setAttribute('aria-label', '마지막 댓글 표시 도구');
     const left = textNode('div', 'gh-lca-left'), heading = textNode('span', 'gh-lca-heading');
     heading.append(icon('comment'), document.createTextNode('마지막 댓글'));
@@ -1363,9 +1462,22 @@
     refreshButton.addEventListener('click', () => refreshVisible());
     const pauseButton = document.createElement('button'); pauseButton.type = 'button'; pauseButton.dataset.action = 'pause';
     pauseButton.addEventListener('click', () => setPaused(!userPaused));
-    const details = document.createElement('details'), summary = document.createElement('summary');
-    summary.append(icon('settings'), document.createTextNode('표시')); summary.setAttribute('aria-label', '마지막 댓글 표시 설정');
-    const panel = textNode('div', 'gh-lca-settings');
+    const settingsButton = document.createElement('button'); settingsButton.type = 'button';
+    settingsButton.append(icon('settings'), document.createTextNode('표시'));
+    settingsButton.setAttribute('aria-label', '마지막 댓글 표시 설정'); settingsButton.setAttribute('aria-haspopup', 'dialog');
+    settingsButton.setAttribute('aria-controls', SETTINGS_ID); settingsButton.setAttribute('aria-expanded', 'false');
+    settingsButton.setAttribute('popovertarget', SETTINGS_ID);
+    settingsButton.addEventListener('click', event => { event.preventDefault(); openSettings(); });
+    const panel = textNode('div', 'gh-lca-settings'); panel.id = SETTINGS_ID; panel.hidden = true; panel.setAttribute(OWN, '');
+    panel.setAttribute('role', 'dialog'); panel.setAttribute('aria-label', '마지막 댓글 표시 설정');
+    panel.addEventListener('click', event => event.stopPropagation());
+    panel.addEventListener('toggle', event => {
+      if (event.target === panel && event.newState === 'closed' && !panel.matches(':popover-open')) closeSettings(false, true);
+    });
+    const panelHeading = textNode('div', 'gh-lca-settings-heading', '표시 설정');
+    const closeButton = textNode('button', 'gh-lca-settings-close', '×'); closeButton.type = 'button';
+    closeButton.setAttribute('aria-label', '표시 설정 닫기'); closeButton.addEventListener('click', () => closeSettings(true));
+    panelHeading.append(closeButton); panel.append(panelHeading);
     for (const [key, text] of [['avatars', '작성자 아바타 표시'], ['noComments', '댓글 없음도 표시']]) {
       const label = document.createElement('label'), input = document.createElement('input'); input.type = 'checkbox'; input.checked = prefs[key]; input.dataset.pref = key;
       input.addEventListener('change', () => { prefs[key] = input.checked; savePrefs(); for (const r of records.values()) paint(r); });
@@ -1382,7 +1494,8 @@
     ttlLabel.append(select); panel.append(ttlLabel);
     const help = textNode('div', 'gh-lca-help', '파랑: 다른 사람 · 회색: 내 댓글/봇\n노랑: 본문에 내 아이디 언급\n점선 + 이전 결과: 최신 여부 확인 중\n일반 댓글만 표시해. 답변 필요 여부를 판단하는 표시는 아니야.'); help.style.whiteSpace = 'pre-line'; panel.append(help);
     const diagnostic = document.createElement('button'); diagnostic.type = 'button'; diagnostic.textContent = '진단 로그 저장'; diagnostic.addEventListener('click', downloadDiagnostics); panel.append(diagnostic);
-    details.append(summary, panel); tools.append(refreshButton, pauseButton, details); toolbar.append(left, tools);
+    settingsPopup.panel = panel; settingsPopup.button = settingsButton; document.body.append(panel);
+    tools.append(refreshButton, pauseButton, settingsButton); toolbar.append(left, tools);
     const list = first.row.closest('ul, ol, table, [role="list"], [role="grid"], .js-navigation-container, [data-testid="list-view-items"]') || first.row.parentElement;
     const main = mainRoot();
     if (list && list !== main && main.contains(list)) list.insertAdjacentElement('beforebegin', toolbar);
@@ -1520,7 +1633,7 @@
   }
   function visibilityChanged() {
     if (document.visibilityState === 'hidden') {
-      closePreview(); clearTimeout(maintenanceTimer); clearTimeout(scanTimer); cancelJobs();
+      closeSettings(); closePreview(); clearTimeout(maintenanceTimer); clearTimeout(scanTimer); cancelJobs();
     } else {
       if (context.identity !== identity()) navigationChanged();
       else { if (fullScanWanted || dirtyRoots.size || cleanupWanted) scheduleScan(); else maintain(); }
@@ -1554,18 +1667,10 @@
   window.addEventListener('popstate', navigationChanged);
   window.addEventListener('online', () => { maintain(); pump(); });
   window.addEventListener('offline', () => { cancelJobs(); for (const r of records.values()) paint(r); updateToolbar(); });
-  window.addEventListener('pagehide', () => { closePreview(); previewCache.clear(); renderedPreviewCache.clear(); cancelJobs(); clearTimeout(maintenanceTimer); });
+  window.addEventListener('pagehide', () => { closeSettings(); closePreview(); previewCache.clear(); renderedPreviewCache.clear(); cancelJobs(); clearTimeout(maintenanceTimer); });
   window.addEventListener('pageshow', event => { if (event.persisted) navigationChanged(); });
   // Chromium의 pushState/replaceState도 잡는다. 지원하지 않는 환경은 GitHub 내비게이션 이벤트와 DOM 관찰을 사용한다.
   if (window.navigation?.addEventListener) window.navigation.addEventListener('currententrychange', navigationChanged);
-  document.addEventListener('click', event => {
-    const details = toolbar?.querySelector('details');
-    if (details?.open && !details.contains(event.target)) details.open = false;
-  });
-  document.addEventListener('keydown', event => {
-    const details = toolbar?.querySelector('details');
-    if (event.key === 'Escape' && details?.open) { details.open = false; details.querySelector('summary').focus(); event.stopPropagation(); }
-  });
   new MutationObserver(mutationsChanged).observe(document.documentElement,
     { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['href', 'datetime', 'content'] });
   fullScanWanted = true; scan();
