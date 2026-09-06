@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GitHub 이슈 목록 - 마지막 댓글 작성자
 // @namespace    https://github.com/
-// @version      1.4.0
-// @description  일반 댓글의 마지막 작성자를 표시한다. 생략 구간 검증, 요청 제한, 갱신, 본문 없는 진단 로그를 지원한다.
+// @version      1.5.0
+// @description  마지막 일반 댓글을 빠르고 작게 표시한다. 가시 영역 우선 조회, 이전 결과 유지, 증분 DOM 처리와 목록 도구모음을 지원한다.
 // @match        https://github.com/*
 // @icon         https://github.githubassets.com/favicons/favicon.svg
 // @grant        GM_registerMenuCommand
@@ -15,7 +15,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.4.0';
+  const VERSION = '1.5.0';
   const CONFIG = Object.freeze({
     cacheMinutes: 2,
     noCommentCacheSeconds: 60,
@@ -26,6 +26,10 @@
     pageSize: 50,
     maxTimelinePages: 40,     // 무한 조회 방지. 넘으면 추측 대신 오류 표시
     maxCacheEntries: 250,
+    maxIssueJobs: 2,          // HTTP 대기가 아니라 실제 조회 시작부터 이슈 제한시간을 잰다
+    staleMinutes: 15,        // 이전 결과는 반드시 이전 결과라고 표시한다
+    prefetchMargin: 240,
+    maintenanceMs: 30_000,
     showAvatar: true,
     showNoComments: true,
   });
@@ -33,12 +37,12 @@
   // 사용자가 2026-07-30에 캡처한 값. 현재 서버에서 유효하다고 가정하지 않는다.
   // GitHub의 실제 Load more GET 요청을 관찰하면 새 해시만 학습한다.
   const FALLBACK_QUERY = 'c652a4589fe3db2aa2c32d0577666ec3';
-  const PREFIX = 'gh-last-comment-author:v5:';
+  const PREFIX = 'gh-last-comment-author:v6:';
   const QUERY_KEY = `${PREFIX}pagination-query`;
   const MARKER = 'gh-last-comment-author';
   const OWN = 'data-gh-lca-owned';
   const STYLE_ID = 'gh-last-comment-author-style';
-  const SINGLETON = '__ghLca14Running';
+  const SINGLETON = '__ghLca15Running';
   if (document[SINGLETON]) return;
   document[SINGLETON] = true;
 
@@ -77,7 +81,11 @@
   const startedAt = Date.now();
   const events = [];
   const aliases = new Map();
-  const stats = { requests: 0, cacheHits: 0, successes: 0, failures: 0, cancelled: 0, pages: 0 };
+  const stats = { requests: 0, cacheHits: 0, successes: 0, failures: 0, cancelled: 0, pages: 0,
+    fullScans: 0, partialScans: 0, linksExamined: 0, renders: 0, memoryHits: 0,
+    cachePrunes: 0, commentFastPaths: 0, avoidedPagination: 0, sharedJobs: 0 };
+  let userPaused = false;
+  const networkAllowed = () => !userPaused && document.visibilityState !== 'hidden' && navigator.onLine !== false && !!routeKind();
 
   // 로그에는 정해진 이벤트명·건수·HTTP 상태만 넣는다. URL이나 본문은 전달하지 않는다.
   function log(event, fields = {}) {
@@ -115,51 +123,88 @@
     return str(document.querySelector('meta[name="user-login"]')?.content,
       document.querySelector('header img.avatar-user[alt^="@"]')?.alt).replace(/^@/, '');
   }
-  const cacheKey = (info, me) => `${PREFIX}cache:${encodeURIComponent(me.toLowerCase() || 'anonymous')}:${keyOf(info)}`;
-  const ttlFor = result => result.kind === 'none' ? CONFIG.noCommentCacheSeconds * 1000 : CONFIG.cacheMinutes * 60_000;
-  function getCache(info, signature, me) {
-    const entry = storageGet(cacheKey(info, me));
-    if (!entry || entry.signature !== signature || !validResult(entry.value) ||
-        !Number.isFinite(entry.at) || Date.now() < entry.at || Date.now() - entry.at >= ttlFor(entry.value)) return null;
-    // 저장소 데이터도 신뢰하지 않는다. 외부 링크나 외부 아바타는 재사용하지 않는다.
-    if (entry.value.kind === 'comment') {
-      const p = parseConversationUrl(entry.value.commentUrl);
-      if (!p || new URL(entry.value.commentUrl).hash.match(/^#issuecomment-\d+$/) === null) return null;
-      entry.value.avatar = safeAvatar(entry.value.avatar);
+  // 표시 설정만 localStorage에 보관한다. 댓글 결과는 탭별 sessionStorage에만 둔다.
+  const PREFS_KEY = 'gh-last-comment-author:ui:v1';
+  const defaults = { compact: true, avatars: true, noComments: true, cacheMinutes: 2 };
+  let prefs = { ...defaults };
+  try {
+    const saved = JSON.parse(localStorage.getItem(PREFS_KEY) || 'null');
+    if (obj(saved)) {
+      for (const name of ['compact', 'avatars', 'noComments']) if (typeof saved[name] === 'boolean') prefs[name] = saved[name];
+      if ([2, 5, 10].includes(saved.cacheMinutes)) prefs.cacheMinutes = saved.cacheMinutes;
     }
-    return entry;
-  }
+  } catch {}
+  function savePrefs() { try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch {} }
+  const memoryCache = new Map();
+  const staleTTL = CONFIG.staleMinutes * 60_000;
+  let pruneTimer = null, lastPrune = 0;
+  const cacheKey = (info, me) => `${PREFIX}cache:${encodeURIComponent(me.toLowerCase() || 'anonymous')}:${keyOf(info)}`;
+  const ttlFor = result => result.kind === 'none' ? CONFIG.noCommentCacheSeconds * 1000 : prefs.cacheMinutes * 60_000;
   function validResult(v) {
     return obj(v) && (v.kind === 'none' || (v.kind === 'comment' &&
       typeof v.author === 'string' && typeof v.commentUrl === 'string' &&
       Number.isFinite(Date.parse(v.time)) && typeof v.mentionsMe === 'boolean'));
   }
+  function remember(key, entry) {
+    memoryCache.delete(key); memoryCache.set(key, entry);
+    if (memoryCache.size > CONFIG.maxCacheEntries) memoryCache.delete(memoryCache.keys().next().value);
+  }
+  function getCache(info, signature, me, allowStale = false) {
+    const key = cacheKey(info, me);
+    let entry = memoryCache.get(key);
+    if (entry) stats.memoryHits++;
+    else entry = storageGet(key);
+    if (!entry || entry.signature !== signature || !validResult(entry.value) || !Number.isFinite(entry.at)) return null;
+    const age = Date.now() - entry.at;
+    if (age < 0 || age >= (allowStale ? staleTTL : ttlFor(entry.value))) return null;
+    if (entry.value.kind === 'comment') {
+      const p = parseConversationUrl(entry.value.commentUrl);
+      if (!p || !/^#issuecomment-\d+$/.test(new URL(entry.value.commentUrl).hash)) return null;
+      entry.value.avatar = safeAvatar(entry.value.avatar);
+    }
+    remember(key, entry); return entry;
+  }
+  function deleteCache(info, me) {
+    const key = cacheKey(info, me); memoryCache.delete(key); storageDelete(key);
+  }
   function setCache(info, signature, me, result) {
-    // 본문과 HTML은 저장하지 않는다. 계정별로 분리한 탭 내부 단기 캐시다.
     const value = result.kind === 'none' ? { kind: 'none' } : {
-      kind: 'comment', author: result.author, avatar: result.avatar, time: result.time,
-      commentUrl: result.commentUrl, isBot: result.isBot, mentionsMe: result.mentionsMe,
+      kind: 'comment', author: result.author, avatar: safeAvatar(result.avatar), time: result.time,
+      commentUrl: result.commentUrl, isBot: !!result.isBot, mentionsMe: !!result.mentionsMe,
     };
     const entry = { at: Date.now(), signature, value };
-    storageSet(cacheKey(info, me), entry);
-    pruneCache(); return entry;
+    const key = cacheKey(info, me);
+    remember(key, entry); storageSet(key, entry);
+    schedulePrune(); return entry;
+  }
+  function schedulePrune() {
+    if (pruneTimer !== null) return;
+    pruneTimer = setTimeout(() => {
+      pruneTimer = null;
+      if (typeof requestIdleCallback === 'function') requestIdleCallback(() => pruneCache(), { timeout: 5000 });
+      else pruneCache();
+    }, Math.max(1500, 60_000 - (Date.now() - lastPrune)));
   }
   function pruneCache(clear = false) {
+    lastPrune = Date.now(); stats.cachePrunes++;
+    if (clear) memoryCache.clear();
     try {
       const entries = [];
       for (const key of Object.keys(sessionStorage)) {
         if (!key.startsWith(`${PREFIX}cache:`)) continue;
         const value = storageGet(key);
-        if (clear || !value?.value || !Number.isFinite(value.at) || Date.now() - value.at >= ttlFor(value.value)) storageDelete(key);
-        else entries.push([key, value.at]);
+        if (clear || !value?.value || !Number.isFinite(value.at) || Date.now() - value.at >= staleTTL) {
+          storageDelete(key); memoryCache.delete(key);
+        } else entries.push([key, value.at]);
       }
       entries.sort((a, b) => b[1] - a[1]);
-      for (const [key] of entries.slice(CONFIG.maxCacheEntries)) storageDelete(key);
-      // v1.3에서 남긴 댓글 본문 포함 캐시만 정리한다. 다른 저장소 값은 건드리지 않는다.
-      for (const key of Object.keys(localStorage)) {
-        if (key.startsWith('gh-last-comment-author:v4:')) localStorage.removeItem(key);
-      }
+      for (const [key] of entries.slice(CONFIG.maxCacheEntries)) { storageDelete(key); memoryCache.delete(key); }
     } catch {}
+  }
+  function cleanOldCaches() {
+    // v1.3의 본문 포함 캐시 및 v1.4 결과만 최초 실행 때 정리한다.
+    try { for (const key of Object.keys(localStorage)) if (key.startsWith('gh-last-comment-author:v4:')) localStorage.removeItem(key); } catch {}
+    try { for (const key of Object.keys(sessionStorage)) if (key.startsWith('gh-last-comment-author:v5:cache:')) sessionStorage.removeItem(key); } catch {}
   }
 
   let queryHash = FALLBACK_QUERY;
@@ -207,7 +252,7 @@
   }
   function pump() {
     clearTimeout(pumpTimer);
-    if (!requestQueue.length || activeRequests >= CONFIG.concurrency) return;
+    if (!requestQueue.length || activeRequests >= CONFIG.concurrency || !networkAllowed()) return;
     if (Date.now() < pausedUntil) {
       for (const q of requestQueue.splice(0)) {
         q.signal?.removeEventListener('abort', q.cancel); q.reject(fail('RATE_LIMIT'));
@@ -246,7 +291,7 @@
           (response.headers.get('x-ratelimit-remaining') === '0' || response.headers.has('retry-after') || /rate limit|abuse detection/i.test(text)))) {
         const retry = response.headers.get('retry-after');
         const delay = retry && /^\d+$/.test(retry) ? Number(retry) * 1000 : Date.parse(retry || '') - Date.now();
-        pausedUntil = Date.now() + Math.min(300_000, Math.max(60_000, Number.isFinite(delay) ? delay : 60_000));
+        pausedUntil = Date.now() + Math.max(60_000, Number.isFinite(delay) ? delay : 60_000);
         throw fail('RATE_LIMIT', response.status);
       }
       if (response.status === 401 || response.status === 403) throw fail('AUTH', response.status);
@@ -413,13 +458,20 @@
       author ? `https://github.com/${encodeURIComponent(author)}.png?size=32` : '')) : '';
     return { kind: 'comment', commentId: id, author, avatar, time,
       commentUrl: `${info.url}#issuecomment-${id}`, isBot: str(actor.__typename, actor.type).toLowerCase() === 'bot' || /\[bot\]$/i.test(author),
-      mentionsMe: mentioned(value, me) };
+      mentionsMe: false, _mentionSource: value, _mentionLogin: me };
   }
   function newest(comments) {
-    if (!comments.size) return { kind: 'none' };
-    const ordered = [...comments.values()].sort((a, b) => Date.parse(a.time) - Date.parse(b.time) ||
-      (BigInt(a.commentId) < BigInt(b.commentId) ? -1 : BigInt(a.commentId) > BigInt(b.commentId) ? 1 : 0));
-    const { commentId, ...result } = ordered.at(-1); return result;
+    let latest = null, latestTime = -Infinity;
+    for (const item of comments.values()) {
+      const stamp = Date.parse(item.time);
+      if (!latest || stamp > latestTime || (stamp === latestTime && BigInt(item.commentId) > BigInt(latest.commentId))) {
+        latest = item; latestTime = stamp;
+      }
+    }
+    if (!latest) return { kind: 'none' };
+    const { commentId, _mentionSource, _mentionLogin, ...result } = latest;
+    result.mentionsMe = _mentionSource ? mentioned(_mentionSource, _mentionLogin) : !!result.mentionsMe;
+    return result;
   }
   function addComments(edges, info, me, into) {
     for (const edge of edges) {
@@ -516,6 +568,16 @@
       addComments(edges, info, me, comments);
     }
     add(frontEdges); add(backEdges);
+    if (total !== null && loaded.size > total) throw fail('SNAPSHOT_CHANGED');
+    if (expectedComments !== null && comments.size > expectedComments) throw fail('INCOMPLETE');
+    // 전체 일반 댓글 수와 이미 검증한 고유 댓글 수가 같으면 빠진 것은 이벤트뿐이다.
+    // 뒤쪽에 댓글이 보인다는 추측만으로는 이 경로를 사용하지 않는다.
+    if (expectedComments !== null && comments.size === expectedComments) {
+      stats.commentFastPaths++;
+      if (pageInfo(front).next !== false && !(total !== null && loaded.size === total)) stats.avoidedPagination++;
+      log('comments_complete', { item: alias(info), comments: comments.size });
+      return newest(comments);
+    }
     let pi = pageInfo(front);
     if (pi.previous === true && !(total !== null && loaded.size === total)) throw fail('INCOMPLETE');
     let cursor = pi.end, pages = 0;
@@ -541,6 +603,13 @@
       const edges = edgesOf(next), previousSize = loaded.size;
       if (backIsTail && edges.some(e => backKeys.has(edgeKey(e)))) joinedTail = true;
       add(edges); pages++; stats.pages++;
+      if (total !== null && loaded.size > total) throw fail('SNAPSHOT_CHANGED');
+      if (expectedComments !== null && comments.size > expectedComments) throw fail('INCOMPLETE');
+      if (expectedComments !== null && comments.size === expectedComments) {
+        stats.commentFastPaths++;
+        log('comments_complete', { item: alias(info), pages, comments: comments.size });
+        return newest(comments);
+      }
       const nextPi = pageInfo(next);
       if (total !== null && loaded.size > total) throw fail('SNAPSHOT_CHANGED');
       const complete = nextPi.next === false || joinedTail || (total !== null && loaded.size === total);
@@ -580,15 +649,20 @@
     if (path === '/search' && !['code', 'commits', 'repositories', 'users', 'discussions'].includes(new URLSearchParams(location.search).get('type'))) return 'search';
     return '';
   }
-  function findTitleLinks() {
-    if (!routeKind()) return [];
-    const root = document.querySelector('main, [role="main"], #repo-content-pjax-container') || document.body;
-    const rows = new Map();
-    for (const link of root.querySelectorAll('a[href*="/issues/"], a[href*="/pull/"]')) {
-      if (link.closest(`[${OWN}], .markdown-body, .comment-body, header, nav, [role="dialog"], [role="tooltip"]`)) continue;
+  const ROW_SELECTOR = '[data-testid="issue-row"], [data-testid="pull-request-row"], [data-testid="list-row"], [data-testid="list-view-item"], [data-listview-item-id], .js-issue-row, .Box-row, [role="row"], [role="listitem"], li';
+  const LINK_SELECTOR = 'a[href*="/issues/"], a[href*="/pull/"]';
+  const EXCLUDED = `[${OWN}], .markdown-body, .comment-body, header, nav, [role="dialog"], [role="tooltip"]`;
+  function mainRoot() { return document.querySelector('main, [role="main"], #repo-content-pjax-container') || document.body; }
+  function findTitleLinks(root = mainRoot()) {
+    if (!routeKind() || !root?.querySelectorAll) return [];
+    const rows = new Map(), links = [...root.querySelectorAll(LINK_SELECTOR)];
+    if (root.matches?.(LINK_SELECTOR)) links.unshift(root);
+    stats.linksExamined += links.length;
+    for (const link of links) {
+      if (link.closest(EXCLUDED)) continue;
       const info = parseConversationUrl(link.href), text = link.textContent.trim();
       if (!info || !text || /^#?\d+$/.test(text) || new URL(link.href).hash) continue;
-      const row = link.closest('[data-testid="issue-row"], [data-testid="pull-request-row"], [data-testid="list-row"], [data-testid="list-view-item"], [data-listview-item-id], .js-issue-row, .Box-row, [role="row"], [role="listitem"], li') || link.parentElement;
+      const row = link.closest(ROW_SELECTOR) || link.parentElement;
       if (!row) continue;
       if (!rows.has(row)) rows.set(row, new Map());
       const candidates = rows.get(row);
@@ -604,22 +678,70 @@
       .filter(n => !n.closest(`[${OWN}]`)).map(n => n.textContent.trim().slice(0, 32));
     return JSON.stringify([times, counts]);
   }
+  const icons = {
+    comment: '<path d="M3 2.75h10a1.25 1.25 0 0 1 1.25 1.25v6A1.25 1.25 0 0 1 13 11.25H6l-3.25 2.5v-2.56A1.25 1.25 0 0 1 1.75 10V4A1.25 1.25 0 0 1 3 2.75Z"/>',
+    refresh: '<path d="M13 5.5A5.25 5.25 0 1 0 13.2 10M13 2.5v3.4H9.6"/>',
+    pause: '<path d="M5.5 3v10M10.5 3v10"/>',
+    play: '<path d="m5.5 3 7 5-7 5Z"/>',
+    settings: '<path d="M2 4h12M2 8h12M2 12h12"/><path d="M5 2.5v3M11 6.5v3M6.5 10.5v3"/>',
+  };
+  function icon(name) {
+    const template = document.createElement('template');
+    // icons에는 코드에 고정한 SVG만 들어가며 서버/사용자 문자열은 넣지 않는다.
+    template.innerHTML = `<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[name] || icons.comment}</svg>`;
+    return template.content.firstElementChild;
+  }
+  function textNode(tag, className, text = '') {
+    const el = document.createElement(tag); el.className = className; el.textContent = text; return el;
+  }
   function addStyles() {
     let style = document.getElementById(STYLE_ID);
     if (!style) { style = document.createElement('style'); style.id = STYLE_ID; document.head.append(style); }
     style.setAttribute(OWN, '');
     style.textContent = `
-      .${MARKER}{display:inline-flex;align-items:center;gap:4px;margin-left:8px;padding:1px 6px;border:1px solid var(--borderColor-muted,#d1d9e0);border-radius:999px;font:500 12px/20px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;vertical-align:middle;white-space:nowrap;background:var(--bgColor-muted,#f6f8fa);color:var(--fgColor-accent,#0969da)}
-      .${MARKER}[hidden]{display:none!important}
-      .${MARKER} a,.${MARKER} button{display:inline-flex;align-items:center;gap:4px;color:inherit!important;text-decoration:none!important;background:transparent;border:0;padding:0;font:inherit;cursor:pointer}
-      .${MARKER} a:focus-visible,.${MARKER} button:focus-visible{outline:2px solid currentColor;outline-offset:3px}
-      .${MARKER}[data-kind="mine"],.${MARKER}[data-kind="none"],.${MARKER}[data-kind="loading"]{color:var(--fgColor-muted,#59636e)}
-      .${MARKER}[data-kind="mention"]{color:var(--fgColor-attention,#9a6700);border-color:var(--borderColor-attention-emphasis,#bf8700);background:var(--bgColor-attention-muted,#fff8c5)}
-      .${MARKER}[data-kind="bot"]{opacity:.7}
-      .${MARKER}[data-kind="error"]{color:var(--fgColor-danger,#d1242f)}
-      .${MARKER} img{width:16px;height:16px;border-radius:50%}
-      .${MARKER} .gh-lca-time{color:var(--fgColor-muted,#59636e);font-weight:400}
-      @media(max-width:700px){.${MARKER} .gh-lca-prefix,.${MARKER} .gh-lca-time{display:none}}
+      .${MARKER},.gh-lca-bar{--lca-bg:var(--bgColor-default,var(--color-canvas-default,#fff));--lca-muted-bg:var(--bgColor-muted,var(--color-canvas-subtle,#f6f8fa));--lca-border:var(--borderColor-default,var(--color-border-default,#d1d9e0));--lca-fg:var(--fgColor-default,var(--color-fg-default,#1f2328));--lca-muted:var(--fgColor-muted,var(--color-fg-muted,#59636e));--lca-accent:var(--fgColor-accent,var(--color-accent-fg,#0969da));box-sizing:border-box;font:400 12px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--lca-fg)}
+      .${MARKER} *,.gh-lca-bar *{box-sizing:border-box}
+      .${MARKER}{display:inline-flex;vertical-align:middle;align-items:center;gap:7px;width:282px;max-width:100%;min-width:0;height:30px;margin:3px 0 3px 8px;padding:0 3px 0 8px;border:1px solid var(--lca-border);border-radius:6px;background:var(--lca-bg);white-space:nowrap;text-align:left}
+      .${MARKER}[data-detail="true"]{width:354px}
+      .${MARKER}[hidden],.gh-lca-bar [hidden]{display:none!important}
+      .${MARKER} .gh-lca-main{display:inline-flex;align-items:center;flex:1;gap:6px;min-width:0;color:inherit;text-decoration:none!important;font:inherit;outline-offset:2px}
+      .${MARKER} .gh-lca-author{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;font-weight:600}
+      .${MARKER} .gh-lca-time{margin-left:auto;color:var(--lca-muted);font-size:11px;flex:none;font-variant-numeric:tabular-nums}
+      .${MARKER} .gh-lca-prefix{color:var(--lca-muted);flex:none;font-size:11px}
+      .${MARKER} img,.${MARKER} .gh-lca-avatar{width:16px;height:16px;flex:none;border-radius:50%;object-fit:cover}
+      .${MARKER} .gh-lca-avatar{display:grid;place-items:center;background:var(--lca-muted-bg);color:var(--lca-muted);font-size:10px;font-weight:600}
+      .${MARKER} .gh-lca-flag{font-size:10px;line-height:17px;padding:0 4px;border-radius:3px;background:var(--lca-muted-bg);color:var(--lca-muted);flex:none}
+      .${MARKER} .gh-lca-flag:empty{display:none}
+      .${MARKER}[data-kind="other"]{color:var(--lca-accent)}
+      .${MARKER}[data-kind="mine"],.${MARKER}[data-kind="bot"],.${MARKER}[data-kind="none"],.${MARKER}[data-kind="loading"]{color:var(--lca-muted)}
+      .${MARKER}[data-kind="mention"]{border-color:var(--borderColor-attention-emphasis,var(--color-attention-emphasis,#9a6700));background:var(--bgColor-attention-muted,var(--color-attention-subtle,#fff8c5));color:var(--fgColor-attention,var(--color-attention-fg,#7d4e00))}
+      .${MARKER}[data-kind="mention"] .gh-lca-flag{background:var(--lca-bg);color:inherit}
+      .${MARKER}[data-kind="error"]{color:var(--fgColor-danger,var(--color-danger-fg,#d1242f))}
+      .${MARKER}[data-stale="true"]{border-style:dashed}
+      .${MARKER}[data-stale="true"] .gh-lca-flag{color:var(--fgColor-attention,var(--color-attention-fg,#7d4e00))}
+      .${MARKER} .gh-lca-action,.gh-lca-bar button,.gh-lca-bar summary{appearance:none;display:inline-flex;align-items:center;justify-content:center;gap:5px;min-height:28px;border:1px solid transparent;border-radius:5px;padding:3px 7px;background:transparent;color:var(--lca-muted);font:inherit;cursor:pointer;text-decoration:none;white-space:nowrap}
+      .${MARKER} .gh-lca-action{flex:none;width:26px;min-height:26px;padding:4px;color:var(--lca-muted)}
+      .${MARKER} .gh-lca-action:hover,.gh-lca-bar button:hover,.gh-lca-bar summary:hover{background:var(--lca-muted-bg);color:var(--lca-fg)}
+      .${MARKER} a:focus-visible,.${MARKER} button:focus-visible,.gh-lca-bar :is(button,summary,select,input):focus-visible{outline:2px solid var(--lca-accent);outline-offset:2px}
+      .${MARKER} button:disabled,.gh-lca-bar button:disabled{cursor:default;opacity:.55}
+      .${MARKER}[data-busy="true"] .gh-lca-action svg{animation:gh-lca-turn 1.3s linear infinite}
+      @keyframes gh-lca-turn{to{transform:rotate(360deg)}}
+      .gh-lca-bar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px 16px;position:relative;margin:0 0 12px;padding:8px 12px;border:1px solid var(--lca-border);border-radius:6px;background:var(--lca-bg);isolation:isolate}
+      .gh-lca-bar .gh-lca-left,.gh-lca-bar .gh-lca-tools{display:flex;align-items:center;flex-wrap:wrap;gap:8px;min-width:0}
+      .gh-lca-bar .gh-lca-heading{display:flex;align-items:center;gap:6px;font-weight:600;color:var(--lca-fg);white-space:nowrap}
+      .gh-lca-bar .gh-lca-status{color:var(--lca-muted);font-size:11px}
+      .gh-lca-bar button[aria-pressed="true"]{border-color:var(--lca-border);background:var(--lca-muted-bg);color:var(--lca-fg)}
+      .gh-lca-bar details{position:relative}
+      .gh-lca-bar summary{list-style:none}
+      .gh-lca-bar summary::-webkit-details-marker{display:none}
+      .gh-lca-bar .gh-lca-settings{position:absolute;right:0;top:calc(100% + 8px);z-index:30;width:260px;max-width:calc(100vw - 32px);padding:14px;border:1px solid var(--lca-border);border-radius:8px;background:var(--lca-bg);box-shadow:0 8px 24px #0002;color:var(--lca-fg);white-space:normal}
+      .gh-lca-bar .gh-lca-settings label{display:flex;align-items:center;gap:8px;margin:0 0 12px;cursor:pointer}
+      .gh-lca-bar .gh-lca-settings input{accent-color:var(--lca-accent);margin:0}
+      .gh-lca-bar .gh-lca-settings select{margin-left:auto;background:var(--lca-bg);color:var(--lca-fg);border:1px solid var(--lca-border);border-radius:4px;padding:3px 5px;font:inherit}
+      .gh-lca-bar .gh-lca-help{color:var(--lca-muted);font-size:11px;line-height:1.7;border-top:1px solid var(--lca-border);padding-top:10px;margin-top:3px}
+      @media(max-width:700px){.${MARKER}{display:flex;margin-left:0;width:282px;height:34px}.${MARKER} .gh-lca-action{width:30px;min-height:30px}.gh-lca-bar{padding:8px;gap:7px}.gh-lca-bar .gh-lca-tools{margin-left:auto;gap:3px}.gh-lca-bar .gh-lca-left{flex-basis:100%}.gh-lca-bar button,.gh-lca-bar summary{min-height:32px}.gh-lca-bar .gh-lca-settings{position:fixed;top:auto;right:16px;max-height:65vh;overflow:auto}}
+      @media(prefers-reduced-motion:reduce){.${MARKER} *{animation:none!important;transition:none!important}}
+      @media(forced-colors:active){.${MARKER},.gh-lca-bar{border:1px solid CanvasText}.${MARKER} .gh-lca-flag{outline:1px solid CanvasText}}
     `;
   }
   const relativeFormatter = new Intl.RelativeTimeFormat('ko', { numeric: 'auto' });
@@ -638,150 +760,390 @@
     if (result.mentionsMe) return 'mention';
     return result.isBot ? 'bot' : 'other';
   }
-  function render(record, result, me, at) {
-    const marker = record.marker; marker.hidden = false; marker.replaceChildren();
-    marker.dataset.kind = markerKind(result, me);
-    if (result.kind === 'none') {
-      marker.textContent = '댓글 없음'; marker.hidden = !CONFIG.showNoComments;
-      marker.title = '일반 댓글이 0개인 것을 확인했어. 이슈 본문, 이벤트, 코드줄 리뷰 댓글은 제외해'; return;
+  function setText(el, text) { if (el.textContent !== text) el.textContent = text; }
+  function paint(record) {
+    const m = record.marker, result = record.value;
+    const busy = record.state === 'loading', waiting = record.state === 'queued';
+    const stale = !!result && (Date.now() >= record.freshUntil || !!record.error || record.forced);
+    const kind = result ? markerKind(result, context.me) : record.error ? 'error' : 'loading';
+    m.dataset.kind = kind; m.dataset.stale = String(stale); m.dataset.busy = String(busy);
+    m.dataset.detail = String(!prefs.compact);
+    m.hidden = result?.kind === 'none' && !prefs.noComments && !stale;
+    m.setAttribute('aria-busy', String(busy));
+    const contentKey = JSON.stringify([result, kind, prefs.avatars, prefs.compact]);
+    if (record.contentKey !== contentKey) {
+      record.contentKey = contentKey; stats.renders++;
+      const primary = document.createElement(result?.kind === 'comment' ? 'a' : 'span');
+      primary.className = 'gh-lca-main';
+      if (result?.kind === 'comment') {
+        primary.href = result.commentUrl;
+        primary.addEventListener('click', e => e.stopPropagation());
+        if (prefs.avatars) {
+          const fallback = textNode('span', 'gh-lca-avatar', (result.author[0] || '?').toUpperCase()); fallback.setAttribute('aria-hidden', 'true');
+          const avatar = safeAvatar(result.avatar);
+          if (avatar) {
+            const image = document.createElement('img'); image.src = avatar; image.alt = ''; image.width = 16; image.height = 16;
+            image.loading = 'lazy'; image.decoding = 'async'; image.referrerPolicy = 'no-referrer';
+            image.addEventListener('error', () => image.replaceWith(fallback), { once: true }); primary.append(image);
+          } else primary.append(fallback);
+        }
+        if (!prefs.compact) primary.append(textNode('span', 'gh-lca-prefix', '마지막 댓글'));
+        primary.append(textNode('span', 'gh-lca-author', result.author ? `@${result.author}` : '작성자 정보 없음'));
+        record.timeEl = textNode('span', 'gh-lca-time', relativeTime(result.time)); primary.append(record.timeEl);
+      } else {
+        record.timeEl = null; primary.append(icon('comment'));
+        primary.append(textNode('span', 'gh-lca-label', ''));
+      }
+      record.primary.replaceWith(primary); record.primary = primary;
     }
-    const link = document.createElement('a'); link.href = result.commentUrl;
-    link.title = `작성자: ${result.author ? '@' + result.author : '삭제된 계정 또는 작성자 미제공'}\n작성: ${new Date(result.time).toLocaleString('ko-KR')}\n확인: ${new Date(at).toLocaleString('ko-KR')}\n클릭하면 일반 댓글로 이동해${result.mentionsMe ? '\n본문에 내 아이디가 있어. 실제 알림 전송 여부는 확인하지 않아' : ''}`;
-    if (result.avatar && CONFIG.showAvatar) {
-      const image = document.createElement('img'); image.src = safeAvatar(result.avatar); image.alt = '';
-      image.loading = 'lazy'; image.referrerPolicy = 'no-referrer'; image.onerror = () => image.remove(); link.append(image);
+    if (result?.kind === 'comment') {
+      if (record.timeEl) setText(record.timeEl, relativeTime(result.time));
+      const meaning = kind === 'mine' ? '내가 쓴 댓글' : kind === 'mention' ? '본문에 내 아이디가 있어. 실제 알림 전송 여부는 확인하지 않아' : kind === 'bot' ? '봇이 쓴 댓글' : '다른 사람이 쓴 댓글';
+      const title = `${stale ? '이전 조회 결과야. 최신 댓글은 아직 확인하지 못했어.\n' : ''}${meaning}\n작성자: ${result.author ? '@' + result.author : '작성자 정보 없음'}\n작성: ${new Date(result.time).toLocaleString('ko-KR')}\n확인: ${new Date(record.at).toLocaleString('ko-KR')}\n클릭하면 이 일반 댓글로 이동해${record.error ? `\n${record.error.message}` : ''}`;
+      record.primary.title = title; record.primary.setAttribute('aria-label', title.replace(/\n/g, '. '));
+    } else {
+      const label = result?.kind === 'none' ? '댓글 없음' : record.error ? (record.error.code === 'RATE_LIMIT' ? '잠시 조회 제한' : '조회 실패') : busy ? '댓글 확인 중…' : userPaused ? '조회 일시정지' : navigator.onLine === false ? '오프라인' : '댓글 확인 대기';
+      setText(record.primary.querySelector('.gh-lca-label'), label);
+      record.primary.title = record.error ? `${record.error.message}\n오른쪽 재시도 버튼을 눌러줘` : result?.kind === 'none' ? `${stale ? '이전 확인 결과야.\n' : ''}일반 댓글이 0개인 것을 확인했어. 본문·이벤트·코드줄 리뷰 댓글은 제외해` : '화면에 보이는 이슈부터 확인해';
     }
-    const prefix = document.createElement('span'); prefix.className = 'gh-lca-prefix';
-    prefix.textContent = result.mentionsMe && marker.dataset.kind !== 'mine' ? '내 아이디 언급 · ' : '마지막 댓글 ';
-    const author = document.createElement('span'); author.textContent = result.author ? `@${result.author}` : '작성자 정보 없음';
-    const time = document.createElement('span'); time.className = 'gh-lca-time'; time.dataset.datetime = result.time;
-    time.textContent = `· ${relativeTime(result.time)}`; link.append(prefix, author, time); marker.append(link);
-  }
-  function renderError(record, error) {
-    record.marker.hidden = false; record.marker.dataset.kind = 'error';
-    const button = document.createElement('button'); button.type = 'button';
-    button.textContent = error.code === 'RATE_LIMIT' ? '조회 제한 · 재시도' : '마지막 댓글 조회 실패';
-    button.title = `${error.message}\n오류 코드: ${error.code || 'PAGE_SHAPE'}${error.status ? ` / HTTP ${error.status}` : ''}\n클릭하면 다시 시도해`;
-    button.addEventListener('click', event => {
-      event.preventDefault(); event.stopPropagation();
-      if (record.state === 'loading') return;
-      storageDelete(cacheKey(record.info, context.me)); record.lastAttempt = 0;
-      void loadRecord(record, true);
-    });
-    record.marker.replaceChildren(button);
+    setText(record.flag, stale ? '이전 결과' : kind === 'mine' ? '내 댓글' : kind === 'mention' ? '언급' : kind === 'bot' ? '봇' : '');
+    const limited = Date.now() < pausedUntil;
+    record.action.disabled = busy || waiting || userPaused || limited || navigator.onLine === false;
+    const actionLabel = busy ? '댓글 확인 중' : waiting ? '조회 순서를 기다리는 중' : limited ? 'GitHub 조회 제한이 끝나면 다시 시도해' : record.error ? '마지막 댓글 다시 조회' : '이 이슈의 마지막 댓글 새로 조회';
+    record.action.title = actionLabel; record.action.setAttribute('aria-label', actionLabel);
+    updateToolbarSoon();
   }
 
-  let context = { identity: '', me: '', controller: new AbortController(), inflight: new Map() };
-  const records = new Map();
-  let scanTimer, firstScheduled = 0;
+  let context = { identity: '', me: '', controller: new AbortController() };
+  const records = new Map(), recordQueue = new Set(), jobs = new Map();
+  let rowRecords = new WeakMap();
+  let toolbar = null, toolbarTimer = null, scanTimer = null, maintenanceTimer = null;
+  let dirtyRoots = new Set(), fullScanWanted = false, cleanupWanted = false, firstScheduled = 0;
   const identity = () => `${location.pathname}${location.search}|${currentLogin().toLowerCase()}`;
+  function activeRecords() { return [...records.values()].filter(r => r.link.isConnected); }
+  function makeRecord(item, signature) {
+    const marker = textNode('span', MARKER); marker.setAttribute(OWN, '');
+    const primary = textNode('span', 'gh-lca-main'), flag = textNode('span', 'gh-lca-flag');
+    const action = document.createElement('button'); action.type = 'button'; action.className = 'gh-lca-action'; action.append(icon('refresh'));
+    marker.append(primary, flag, action);
+    const record = { ...item, marker, primary, flag, action, signature, version: 1, state: 'new',
+      freshUntil: 0, lastAttempt: 0, near: !nearObserver, inView: !viewObserver, value: null, at: 0, error: null, forced: false, job: null };
+    action.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); enqueue(record, true); });
+    records.set(item.link, record);
+    let set = rowRecords.get(item.row); if (!set) rowRecords.set(item.row, set = new Set()); set.add(record);
+    item.link.insertAdjacentElement('afterend', marker);
+    // DOM에 추가한 직후 동기 레이아웃 계산을 하지 않는다. 가시성 판정은 Observer에 맡긴다.
+    nearObserver?.observe(item.link); viewObserver?.observe(item.link);
+    const cached = getCache(item.info, signature, context.me, true);
+    if (cached) { stats.cacheHits++; applyEntry(record, cached); } else paint(record);
+    return record;
+  }
+  function removeRecord(record) {
+    record.version++; recordQueue.delete(record);
+    record.job?.subscribers.delete(record);
+    if (record.job && !record.job.subscribers.size) record.job.controller.abort();
+    nearObserver?.unobserve(record.link); viewObserver?.unobserve(record.link);
+    record.marker.remove(); records.delete(record.link); rowRecords.get(record.row)?.delete(record);
+  }
+  function applyEntry(record, entry) {
+    record.value = entry.value; record.at = entry.at; record.freshUntil = entry.at + ttlFor(entry.value);
+    record.state = 'done'; record.error = null; record.forced = false; paint(record);
+  }
+  function cancelJobs() {
+    recordQueue.clear();
+    for (const job of jobs.values()) job.controller.abort();
+    jobs.clear();
+    for (const r of records.values()) {
+      r.job = null;
+      if (r.state === 'loading' || r.state === 'queued') { r.state = r.value ? 'done' : 'new'; r.forced = false; paint(r); }
+    }
+    clearTimeout(pumpTimer);
+  }
   function resetContext(clearCache = false) {
-    context.controller.abort();
-    for (const record of records.values()) { visibilityObserver?.unobserve(record.link); record.marker.remove(); }
-    records.clear();
-    context = { identity: identity(), me: currentLogin(), controller: new AbortController(), inflight: new Map() };
+    context.controller.abort(); cancelJobs();
+    for (const record of [...records.values()]) removeRecord(record);
+    rowRecords = new WeakMap(); dirtyRoots.clear();
+    toolbar?.remove(); toolbar = null;
+    context = { identity: identity(), me: currentLogin(), controller: new AbortController() };
     if (clearCache) pruneCache(true);
+    clearTimeout(maintenanceTimer);
     log('context_reset', { route: routeKind() || 'other', manual: clearCache });
   }
   function stillCurrent(record, ctx, version) {
     return ctx === context && ctx.identity === identity() && !ctx.controller.signal.aborted && record.version === version &&
-      record.link.isConnected && record.marker.isConnected && parseConversationUrl(record.link.href)?.key === record.info.key &&
+      record.link.isConnected && parseConversationUrl(record.link.href)?.key === record.info.key &&
       rowSignature(record.row) === record.signature;
   }
-  async function loadRecord(record, force = false) {
-    if (!record.visible || record.state === 'loading' || !record.link.isConnected) return;
-    const ctx = context, version = record.version;
-    const cached = !force && getCache(record.info, record.signature, ctx.me);
-    if (cached) {
-      stats.cacheHits++; record.state = 'done'; record.freshUntil = cached.at + ttlFor(cached.value);
-      render(record, cached.value, ctx.me, cached.at); return;
+  function enqueue(record, force = false) {
+    if (!record.link.isConnected || (!record.near && !force)) return;
+    if (record.job || record.state === 'loading') return;
+    if (!force && record.state === 'done' && !record.forced && Date.now() < record.freshUntil) return;
+    if (!force && !record.forced) {
+      const cached = getCache(record.info, record.signature, context.me);
+      if (cached) { stats.cacheHits++; applyEntry(record, cached); return; }
     }
+    if (!networkAllowed()) { paint(record); return; }
+    if (Date.now() < pausedUntil) { record.error = fail('RATE_LIMIT'); record.state = 'error'; paint(record); return; }
     if (!force && record.state === 'error' && Date.now() - record.lastAttempt < 30_000) return;
-    record.state = 'loading'; record.lastAttempt = Date.now(); record.marker.hidden = false;
-    record.marker.dataset.kind = 'loading'; record.marker.textContent = '마지막 댓글 불러오는 중…';
-    try {
-      const pendingKey = `${record.info.key}|${record.signature}`;
-      let pending = ctx.inflight.get(pendingKey);
-      if (!pending) {
-        pending = fetchLastComment(record.info, ctx.me, ctx.controller.signal);
-        ctx.inflight.set(pendingKey, pending);
-        // finally로 새 미처리 rejection을 만들지 않는다.
-        pending.then(() => { if (ctx.inflight.get(pendingKey) === pending) ctx.inflight.delete(pendingKey); },
-          () => { if (ctx.inflight.get(pendingKey) === pending) ctx.inflight.delete(pendingKey); });
+    record.forced ||= force; record.error = null; record.state = 'queued'; recordQueue.add(record); paint(record);
+    // 한 이벤트에서 나온 여러 행을 먼저 모아서 실제 뷰포트 우선순위를 매긴다.
+    queueMicrotask(pumpJobs);
+  }
+  function pumpJobs() {
+    if (!networkAllowed() || Date.now() < pausedUntil || context.identity !== identity()) return;
+    for (const record of [...recordQueue]) {
+      if (!record.link.isConnected || (!record.near && !record.forced)) {
+        recordQueue.delete(record); record.state = record.value ? 'done' : 'new'; paint(record); continue;
       }
-      const result = await pending;
-      if (!stillCurrent(record, ctx, version)) return;
-      const entry = setCache(record.info, record.signature, ctx.me, result);
-      record.state = 'done'; record.freshUntil = entry.at + ttlFor(result); stats.successes++;
-      render(record, result, ctx.me, entry.at);
-    } catch (error) {
-      if (error.code === 'ABORTED' || !stillCurrent(record, ctx, version)) { stats.cancelled++; return; }
-      record.state = 'error'; stats.failures++;
-      const safe = error instanceof LcaError ? error : fail('PAGE_SHAPE');
-      log('item_error', { item: alias(record.info), code: safe.code, status: safe.status });
-      renderError(record, safe);
+      const key = `${record.info.key}|${record.signature}`, existing = jobs.get(key);
+      if (existing) attach(existing, record);
+    }
+    while (jobs.size < CONFIG.maxIssueJobs && recordQueue.size) {
+      const sorted = [...recordQueue].sort((a, b) => Number(b.forced) - Number(a.forced) || Number(b.inView) - Number(a.inView));
+      const record = sorted[0];
+      if (!record) break;
+      const key = `${record.info.key}|${record.signature}`;
+      const controller = new AbortController(), ctx = context;
+      const job = { key, controller, ctx, subscribers: new Map(), info: record.info, signature: record.signature };
+      const onAbort = () => controller.abort(); ctx.controller.signal.addEventListener('abort', onAbort, { once: true });
+      jobs.set(key, job); attach(job, record);
+      for (const other of [...recordQueue]) if (`${other.info.key}|${other.signature}` === key) attach(job, other);
+      void runJob(job).finally(() => {
+        ctx.controller.signal.removeEventListener('abort', onAbort);
+        if (jobs.get(key) === job) jobs.delete(key);
+        pumpJobs(); updateToolbarSoon();
+      });
     }
   }
-  const visibilityObserver = typeof IntersectionObserver === 'function' ? new IntersectionObserver(entries => {
+  function attach(job, record) {
+    if (job.subscribers.size) stats.sharedJobs++;
+    recordQueue.delete(record); job.subscribers.set(record, record.version);
+    record.job = job; record.state = 'loading'; record.lastAttempt = Date.now(); paint(record);
+  }
+  async function runJob(job) {
+    try {
+      // 대기 중인 행에는 아직 fetchLastComment와 120초 타이머를 만들지 않는다.
+      const result = await fetchLastComment(job.info, job.ctx.me, job.controller.signal);
+      if (job.controller.signal.aborted) return;
+      const current = [...job.subscribers].filter(([r, v]) => r.job === job && stillCurrent(r, job.ctx, v));
+      if (!current.length) return;
+      const entry = setCache(job.info, job.signature, job.ctx.me, result);
+      for (const [record] of current) { record.job = null; applyEntry(record, entry); stats.successes++; }
+    } catch (error) {
+      if (error?.code === 'ABORTED' || job.controller.signal.aborted) { stats.cancelled++; return; }
+      const safe = error instanceof LcaError ? error : fail('PAGE_SHAPE');
+      for (const [record, version] of job.subscribers) {
+        if (record.job !== job || !stillCurrent(record, job.ctx, version)) continue;
+        record.job = null; record.state = 'error'; record.error = safe; record.forced = false;
+        stats.failures++; paint(record);
+      }
+      log('item_error', { item: alias(job.info), code: safe.code, status: safe.status });
+    } finally {
+      // 외부 확장이나 React가 행을 바꿨다면 다음 증분 스캔이 새 정보를 처리한다.
+      for (const [record] of job.subscribers) if (record.job === job) {
+        record.job = null; record.state = record.value ? 'done' : 'new';
+        if (record.link.isConnected && job.ctx === context) scheduleScan(record.row);
+      }
+    }
+  }
+  const nearObserver = typeof IntersectionObserver === 'function' ? new IntersectionObserver(entries => {
     for (const entry of entries) {
       const record = records.get(entry.target); if (!record) continue;
-      record.visible = entry.isIntersecting;
-      if (record.visible && (record.state !== 'done' || Date.now() >= record.freshUntil)) void loadRecord(record);
+      record.near = entry.isIntersecting;
+      record.inView = entry.isIntersecting && entry.boundingClientRect.top < innerHeight && entry.boundingClientRect.bottom > 0;
+      if (record.near) enqueue(record);
+      else if (recordQueue.delete(record)) { record.state = record.value ? 'done' : 'new'; record.forced = false; paint(record); }
     }
-  }, { rootMargin: '400px 0px' }) : null;
-  function scan() {
-    clearTimeout(scanTimer); scanTimer = null; firstScheduled = 0;
-    if (context.identity !== identity()) resetContext();
-    if (!routeKind() || document.visibilityState === 'hidden') return;
-    const items = findTitleLinks(), present = new Set(items.map(item => item.link));
-    for (const [link, record] of records) {
-      if (!present.has(link) || !link.isConnected) {
-        visibilityObserver?.unobserve(link); record.marker.remove(); records.delete(link); record.version++;
-      }
+    updateToolbarSoon();
+  }, { rootMargin: `${CONFIG.prefetchMargin}px 0px` }) : null;
+  const viewObserver = typeof IntersectionObserver === 'function' ? new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      const record = records.get(entry.target); if (!record) continue;
+      record.inView = entry.isIntersecting;
+      if (record.inView) { record.near = true; enqueue(record); }
     }
-    for (const item of items) {
-      let record = records.get(item.link);
-      const signature = rowSignature(item.row);
-      if (record && (record.info.key !== item.info.key || record.signature !== signature)) {
-        record.version++; record.marker.remove(); visibilityObserver?.unobserve(item.link); records.delete(item.link); record = null;
-      }
-      if (!record) {
-        const marker = document.createElement('span'); marker.className = MARKER; marker.setAttribute(OWN, '');
-        marker.dataset.kind = 'loading'; marker.textContent = '마지막 댓글 대기 중…';
-        item.link.insertAdjacentElement('afterend', marker);
-        const rect = item.link.getBoundingClientRect();
-        record = { ...item, marker, signature, version: 1, state: 'new', freshUntil: 0, lastAttempt: 0,
-          visible: !visibilityObserver || (item.link.getClientRects().length > 0 && rect.top < innerHeight + 400 && rect.bottom > -400) };
-        records.set(item.link, record); visibilityObserver?.observe(item.link);
-      } else {
-        record.row = item.row;
-        if (!record.marker.isConnected || record.marker.parentElement !== item.link.parentElement) {
-          item.link.insertAdjacentElement('afterend', record.marker);
-        }
-      }
-      if (record.visible && (record.state !== 'done' || Date.now() >= record.freshUntil)) void loadRecord(record);
+    queueMicrotask(pumpJobs);
+  }) : null;
+
+  function ensureToolbar() {
+    const first = records.values().next().value;
+    if (!first) { toolbar?.remove(); toolbar = null; return; }
+    if (toolbar?.isConnected) return;
+    toolbar = textNode('div', 'gh-lca-bar'); toolbar.setAttribute(OWN, ''); toolbar.setAttribute('role', 'region'); toolbar.setAttribute('aria-label', '마지막 댓글 표시 도구');
+    const left = textNode('div', 'gh-lca-left'), heading = textNode('span', 'gh-lca-heading');
+    heading.append(icon('comment'), document.createTextNode('마지막 댓글'));
+    const status = textNode('span', 'gh-lca-status'); status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite');
+    left.append(heading, status);
+    const tools = textNode('div', 'gh-lca-tools');
+    const refreshButton = document.createElement('button'); refreshButton.type = 'button'; refreshButton.dataset.action = 'refresh';
+    refreshButton.append(icon('refresh'), document.createTextNode('보이는 항목 갱신'));
+    refreshButton.title = '지금 화면에 보이는 이슈만 새로 확인해. 페이지 전체를 다시 읽지 않아';
+    refreshButton.addEventListener('click', () => refreshVisible());
+    const pauseButton = document.createElement('button'); pauseButton.type = 'button'; pauseButton.dataset.action = 'pause';
+    pauseButton.addEventListener('click', () => setPaused(!userPaused));
+    const details = document.createElement('details'), summary = document.createElement('summary');
+    summary.append(icon('settings'), document.createTextNode('표시')); summary.setAttribute('aria-label', '마지막 댓글 표시 설정');
+    const panel = textNode('div', 'gh-lca-settings');
+    for (const [key, text] of [['compact', '간결하게 표시'], ['avatars', '작성자 아바타 표시'], ['noComments', '댓글 없음도 표시']]) {
+      const label = document.createElement('label'), input = document.createElement('input'); input.type = 'checkbox'; input.checked = prefs[key]; input.dataset.pref = key;
+      input.addEventListener('change', () => { prefs[key] = input.checked; savePrefs(); for (const r of records.values()) paint(r); });
+      label.append(input, document.createTextNode(text)); panel.append(label);
     }
+    const ttlLabel = textNode('label', '', '결과 재사용 시간'), select = document.createElement('select'); select.setAttribute('aria-label', '결과 재사용 시간');
+    for (const minutes of [2, 5, 10]) { const option = document.createElement('option'); option.value = String(minutes); option.textContent = `${minutes}분`; select.append(option); }
+    select.value = String(prefs.cacheMinutes);
+    select.addEventListener('change', () => {
+      const value = Number(select.value); if (![2, 5, 10].includes(value)) return;
+      prefs.cacheMinutes = value; savePrefs();
+      for (const r of records.values()) { if (r.value) r.freshUntil = r.at + ttlFor(r.value); paint(r); if (r.near) enqueue(r); }
+    });
+    ttlLabel.append(select); panel.append(ttlLabel);
+    const help = textNode('div', 'gh-lca-help', '파랑: 다른 사람 · 회색: 내 댓글/봇\n노랑: 본문에 내 아이디 언급\n점선 + 이전 결과: 최신 여부 확인 중\n일반 댓글만 표시해. 답변 필요 여부를 판단하는 표시는 아니야.'); help.style.whiteSpace = 'pre-line'; panel.append(help);
+    const diagnostic = document.createElement('button'); diagnostic.type = 'button'; diagnostic.textContent = '진단 로그 저장'; diagnostic.addEventListener('click', downloadDiagnostics); panel.append(diagnostic);
+    details.append(summary, panel); tools.append(refreshButton, pauseButton, details); toolbar.append(left, tools);
+    const list = first.row.closest('ul, ol, table, [role="list"], [role="grid"], .js-navigation-container, [data-testid="list-view-items"]') || first.row.parentElement;
+    const main = mainRoot();
+    if (list && list !== main && main.contains(list)) list.insertAdjacentElement('beforebegin', toolbar);
+    else main.prepend(toolbar);
+    updateToolbar();
   }
-  function scheduleScan() {
+  function updateToolbarSoon() {
+    if (toolbarTimer !== null) return;
+    toolbarTimer = setTimeout(() => { toolbarTimer = null; updateToolbar(); }, 160);
+  }
+  function updateToolbar() {
+    if (!toolbar?.isConnected) return;
+    const all = activeRecords(), done = all.filter(r => !!r.value).length;
+    const previous = all.filter(r => !!r.value && (Date.now() >= r.freshUntil || r.error || r.forced)).length;
+    const errors = all.filter(r => r.error).length, busy = jobs.size + recordQueue.size;
+    const rateSeconds = Math.max(0, Math.ceil((pausedUntil - Date.now()) / 1000));
+    const status = navigator.onLine === false ? '오프라인 · 결과 유지' : userPaused ? '조회 일시정지' : rateSeconds ? `조회 제한 · 약 ${Math.ceil(rateSeconds / 60)}분 후` :
+      `${done}/${all.length} 확인${previous ? ` · 이전 결과 ${previous}` : ''}${errors ? ` · 실패 ${errors}` : busy ? ' · 확인 중' : all.some(r => !r.value && !r.near) ? ' · 화면 밖 대기' : ''}`;
+    setText(toolbar.querySelector('.gh-lca-status'), status);
+    const pause = toolbar.querySelector('[data-action="pause"]');
+    const pressed = String(userPaused);
+    if (pause.getAttribute('aria-pressed') !== pressed) {
+      pause.setAttribute('aria-pressed', pressed); pause.replaceChildren(icon(userPaused ? 'play' : 'pause'), document.createTextNode(userPaused ? '조회 재개' : '일시정지'));
+    }
+    toolbar.querySelector('[data-action="refresh"]').disabled = !networkAllowed() || rateSeconds > 0;
+  }
+  function refreshVisible() {
+    if (!networkAllowed()) return;
+    for (const record of records.values()) if (record.inView && !record.job) enqueue(record, true);
+  }
+  function setPaused(value) {
+    userPaused = !!value;
+    if (userPaused) cancelJobs();
+    else { for (const r of records.values()) if (r.near) enqueue(r); pump(); }
+    for (const r of records.values()) paint(r);
+    updateToolbar(); startMaintenance();
+  }
+
+  function scheduleScan(root = null) {
+    if (!root || !root.querySelectorAll) fullScanWanted = true;
+    else dirtyRoots.add(root);
+    if (document.visibilityState === 'hidden') return;
     const now = Date.now(); if (!firstScheduled) firstScheduled = now;
     clearTimeout(scanTimer);
-    scanTimer = setTimeout(scan, now - firstScheduled > 1200 ? 0 : 200);
+    scanTimer = setTimeout(scan, now - firstScheduled >= 350 ? 0 : 60);
   }
-  function mutationsMatter(mutations) {
-    return mutations.some(mutation => {
+  function scan() {
+    clearTimeout(scanTimer); scanTimer = null; firstScheduled = 0;
+    if (context.identity !== identity()) { resetContext(); fullScanWanted = true; }
+    if (!routeKind() || document.visibilityState === 'hidden') return;
+    const full = fullScanWanted; fullScanWanted = false;
+    let roots = full ? [mainRoot()] : [...dirtyRoots].filter(r => r.isConnected); dirtyRoots.clear();
+    roots = roots.filter((r, i) => !roots.some((other, j) => i !== j && other.contains(r)));
+    const items = roots.flatMap(findTitleLinks);
+    stats[full ? 'fullScans' : 'partialScans']++;
+    const found = new Set(items.map(i => i.link));
+    if (full || cleanupWanted) {
+      cleanupWanted = false;
+      for (const r of [...records.values()]) if (!r.link.isConnected || (full && !found.has(r.link))) removeRecord(r);
+    }
+    for (const root of roots) {
+      const set = rowRecords.get(root);
+      if (set) for (const r of [...set]) if (!found.has(r.link) && root.contains(r.link)) removeRecord(r);
+    }
+    for (const item of items) {
+      let record = records.get(item.link); const signature = rowSignature(item.row);
+      if (record && (record.info.key !== item.info.key || record.signature !== signature || record.row !== item.row)) {
+        removeRecord(record); record = null;
+      }
+      if (!record) record = makeRecord(item, signature);
+      else if (!record.marker.isConnected || record.marker.parentElement !== record.link.parentElement) record.link.insertAdjacentElement('afterend', record.marker);
+      if (record.near) enqueue(record);
+    }
+    ensureToolbar(); startMaintenance();
+  }
+  function mutationsChanged(mutations) {
+    if (context.identity !== identity()) { fullScanWanted = true; scheduleScan(); return; }
+    if (!routeKind()) return;
+    let changed = false;
+    for (const mutation of mutations) {
       const target = mutation.target.nodeType === 1 ? mutation.target : mutation.target.parentElement;
-      if (target?.closest?.(`[${OWN}]`)) return false;
-      if (mutation.type === 'attributes') return true;
-      // 자체 배지 추가로 화면 전체를 재탐색하지 않는다. 외부에서 삭제된 배지는 복구한다.
-      if (!mutation.removedNodes.length && mutation.addedNodes.length &&
-          [...mutation.addedNodes].every(n => n.nodeType === 1 && n.hasAttribute(OWN))) return false;
-      return true;
-    });
+      if (!target || target.closest?.(`[${OWN}]`)) continue;
+      if (mutation.type === 'attributes' && target.matches('meta[name="user-login"]')) { scheduleScan(); return; }
+      const candidates = [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])];
+      // 자기 UI 추가·변경은 무시하되 외부에서 지운 배지는 복구한다.
+      if (mutation.type === 'childList' && !mutation.removedNodes.length && candidates.length && candidates.every(n => n.nodeType === 1 && n.hasAttribute(OWN))) continue;
+      const row = target.closest?.(ROW_SELECTOR) || (rowRecords.has(target) ? target : null);
+      if (row && (rowRecords.has(row) || row.querySelector?.(LINK_SELECTOR))) { dirtyRoots.add(row); changed = true; }
+      for (const node of candidates) {
+        if (node.nodeType !== 1) continue;
+        if (node.hasAttribute(OWN)) {
+          if (!node.isConnected && (node === toolbar || node.classList.contains(MARKER))) {
+            if (row) dirtyRoots.add(row); else ensureToolbar(); changed = true;
+          }
+          continue;
+        }
+        if (node.matches(LINK_SELECTOR) || node.querySelector(LINK_SELECTOR)) {
+          if (node.isConnected) dirtyRoots.add(node.closest(ROW_SELECTOR) || node);
+          else cleanupWanted = true;
+          changed = true;
+        }
+      }
+      if (mutation.type === 'attributes' && target.matches(LINK_SELECTOR)) { dirtyRoots.add(row || target.parentElement); changed = true; }
+    }
+    if (changed) {
+      // 이 경로는 이미 변경된 하위 트리를 알고 있으므로 전체 탐색 플래그를 세우지 않는다.
+      const now = Date.now(); if (!firstScheduled) firstScheduled = now;
+      clearTimeout(scanTimer); if (document.visibilityState !== 'hidden') scanTimer = setTimeout(scan, now - firstScheduled >= 350 ? 0 : 60);
+    }
+  }
+  function startMaintenance() {
+    clearTimeout(maintenanceTimer);
+    if (!routeKind() || document.visibilityState === 'hidden' || !records.size) return;
+    maintenanceTimer = setTimeout(maintain, CONFIG.maintenanceMs);
+  }
+  function maintain() {
+    maintenanceTimer = null;
+    if (document.visibilityState === 'hidden' || !routeKind()) return;
+    for (const record of records.values()) {
+      if (!record.near || !record.link.isConnected) continue;
+      if (record.value) paint(record); // 시간 문자열과 상태만 갱신. 작성자 링크는 재생성하지 않는다.
+      enqueue(record);
+    }
+    updateToolbar(); startMaintenance();
+  }
+  function navigationChanged() {
+    if (context.identity !== identity()) resetContext();
+    scheduleScan();
+  }
+  function visibilityChanged() {
+    if (document.visibilityState === 'hidden') {
+      clearTimeout(maintenanceTimer); clearTimeout(scanTimer); cancelJobs();
+    } else {
+      if (context.identity !== identity()) navigationChanged();
+      else { if (fullScanWanted || dirtyRoots.size || cleanupWanted) scheduleScan(); else maintain(); }
+      pump();
+    }
   }
   function downloadDiagnostics() {
     const report = { version: VERSION, capturedAt: new Date().toISOString(), route: routeKind() || 'other',
       note: '댓글 본문·작성자·저장소명·이슈 주소·쿠키·토큰·GraphQL 변수는 포함하지 않음. 자동 전송하지 않음.',
-      config: CONFIG, stats: { ...stats, activeRequests, queuedRequests: requestQueue.length },
+      config: CONFIG, preferences: prefs, stats: { ...stats, activeRequests, queuedRequests: requestQueue.length,
+        activeIssueJobs: jobs.size, queuedIssues: recordQueue.size, memoryEntries: memoryCache.size },
       learnedQueryDiffersFromFallback: queryHash !== FALLBACK_QUERY, events: [...events] };
     const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob), a = document.createElement('a');
@@ -789,23 +1151,33 @@
     document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
   function refresh() { resetContext(true); scheduleScan(); }
+  // Boot. 테스트 빌드에서만 이 지점 앞에 검사용 함수를 노출한다.
   if (typeof GM_registerMenuCommand === 'function') {
+    GM_registerMenuCommand('마지막 댓글: 보이는 항목 새로 조회', refreshVisible);
+    GM_registerMenuCommand('마지막 댓글: 일시정지 / 재개', () => setPaused(!userPaused));
     GM_registerMenuCommand('마지막 댓글: 캐시 비우고 현재 목록 새로 조회', refresh);
     GM_registerMenuCommand('마지막 댓글: 진단 로그 저장 (본문 제외)', downloadDiagnostics);
   }
-  addStyles(); pruneCache();
-  for (const event of ['turbo:load', 'pjax:end', 'soft-nav:end']) document.addEventListener(event, scheduleScan);
-  document.addEventListener('visibilitychange', scheduleScan);
-  window.addEventListener('focus', scheduleScan); window.addEventListener('popstate', scheduleScan);
-  new MutationObserver(mutations => { if (mutationsMatter(mutations)) scheduleScan(); }).observe(document.documentElement,
-    { childList: true, subtree: true, attributes: true, attributeFilter: ['href', 'datetime', 'content'] });
-  setInterval(() => {
-    if (context.identity !== identity()) { resetContext(); scheduleScan(); }
-  }, 1000);
-  setInterval(() => {
-    if (document.visibilityState === 'hidden' || !routeKind()) return;
-    for (const n of document.querySelectorAll(`.${MARKER} .gh-lca-time[data-datetime]`)) n.textContent = `· ${relativeTime(n.dataset.datetime)}`;
-    scheduleScan();
-  }, 30_000);
-  scan();
+  addStyles(); cleanOldCaches(); pruneCache();
+  for (const event of ['turbo:load', 'pjax:end', 'soft-nav:end']) document.addEventListener(event, navigationChanged);
+  document.addEventListener('visibilitychange', visibilityChanged);
+  window.addEventListener('focus', () => { if (context.identity !== identity()) navigationChanged(); else maintain(); });
+  window.addEventListener('popstate', navigationChanged);
+  window.addEventListener('online', () => { maintain(); pump(); });
+  window.addEventListener('offline', () => { cancelJobs(); for (const r of records.values()) paint(r); updateToolbar(); });
+  window.addEventListener('pagehide', () => { cancelJobs(); clearTimeout(maintenanceTimer); });
+  window.addEventListener('pageshow', event => { if (event.persisted) navigationChanged(); });
+  // Chromium의 pushState/replaceState도 잡는다. 지원하지 않는 환경은 GitHub 내비게이션 이벤트와 DOM 관찰을 사용한다.
+  if (window.navigation?.addEventListener) window.navigation.addEventListener('currententrychange', navigationChanged);
+  document.addEventListener('click', event => {
+    const details = toolbar?.querySelector('details');
+    if (details?.open && !details.contains(event.target)) details.open = false;
+  });
+  document.addEventListener('keydown', event => {
+    const details = toolbar?.querySelector('details');
+    if (event.key === 'Escape' && details?.open) { details.open = false; details.querySelector('summary').focus(); event.stopPropagation(); }
+  });
+  new MutationObserver(mutationsChanged).observe(document.documentElement,
+    { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['href', 'datetime', 'content'] });
+  fullScanWanted = true; scan();
 })();
