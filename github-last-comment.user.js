@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         GitHub 이슈 목록 - 마지막 댓글 작성자
 // @namespace    https://github.com/
-// @version      1.6.0
-// @description  제목 아래 마지막 댓글 작성자와 날짜·요일을 작게 표시하고, 마우스/키보드로 댓글 본문을 미리 본다.
+// @version      1.7.0
+// @description  제목 아래 마지막 댓글 작성자·날짜·요일·오전/오후 시각과 안전한 마크다운 본문 미리보기를 표시한다.
 // @match        https://github.com/*
 // @icon         https://github.githubassets.com/favicons/favicon.svg
+// @require      https://cdn.jsdelivr.net/npm/marked@18.0.7/lib/marked.umd.js
 // @grant        GM_registerMenuCommand
 // @run-at       document-idle
 // @noframes
@@ -15,7 +16,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.6.0';
+  const VERSION = '1.7.0';
   const CONFIG = Object.freeze({
     cacheMinutes: 2,
     noCommentCacheSeconds: 60,
@@ -32,6 +33,9 @@
     maintenanceMs: 30_000,
     previewChars: 16_000,
     maxPreviews: 80,
+    maxPreviewSourceChars: 128_000,
+    maxPreviewNodes: 4_000,
+    maxRenderedPreviews: 8,
     showAvatar: true,
     showNoComments: true,
   });
@@ -44,7 +48,7 @@
   const MARKER = 'gh-last-comment-author';
   const OWN = 'data-gh-lca-owned';
   const STYLE_ID = 'gh-last-comment-author-style';
-  const SINGLETON = '__ghLca16Running';
+  const SINGLETON = '__ghLca17Running';
   if (document[SINGLETON]) return;
   document[SINGLETON] = true;
 
@@ -85,7 +89,7 @@
   const aliases = new Map();
   const stats = { requests: 0, cacheHits: 0, successes: 0, failures: 0, cancelled: 0, pages: 0,
     fullScans: 0, partialScans: 0, linksExamined: 0, renders: 0, memoryHits: 0,
-    cachePrunes: 0, commentFastPaths: 0, avoidedPagination: 0, sharedJobs: 0 };
+    cachePrunes: 0, commentFastPaths: 0, avoidedPagination: 0, sharedJobs: 0, previewRenders: 0 };
   let userPaused = false;
   const networkAllowed = () => !userPaused && document.visibilityState !== 'hidden' && navigator.onLine !== false && !!routeKind();
 
@@ -481,24 +485,129 @@
   const previewCache = new Map();
   const previewKey = (info, me, url) => `${me.toLowerCase()}|${info.key}|${url}`;
   function previewText(source) {
-    if (!obj(source)) return { available: false, text: '', truncated: false };
-    let text, available = false;
-    for (const key of ['bodyText', 'body_text', 'body', 'rawBody', 'raw_body']) {
-      if (typeof source[key] === 'string') { text = source[key]; available = true; break; }
+    const empty = { available: false, format: 'text', text: '', truncated: false };
+    if (!obj(source)) return empty;
+    // bodyText is already stripped; prefer GitHub's HTML, then original Markdown.
+    const fields = [['html', ['bodyHTML', 'bodyHtml', 'body_html']],
+      ['markdown', ['rawBody', 'raw_body', 'body']], ['text', ['bodyText', 'body_text']]];
+    let blank = null;
+    for (const [format, keys] of fields) for (const key of keys) {
+      if (typeof source[key] !== 'string') continue;
+      const text = source[key].replace(/\r\n?/g, '\n');
+      const limit = format === 'html' ? CONFIG.maxPreviewSourceChars : CONFIG.previewChars;
+      const result = { available: true, format, text: text.slice(0, limit), truncated: text.length > limit };
+      if (text.trim()) return result;
+      blank ||= result;
     }
-    if (!available) {
-      const html = ['bodyHTML', 'bodyHtml', 'body_html'].find(k => typeof source[k] === 'string');
-      if (html) {
-        const template = document.createElement('template'); template.innerHTML = source[html];
-        template.content.querySelectorAll('script,style,iframe,object,embed').forEach(n => n.remove());
-        template.content.querySelectorAll('img').forEach(n => n.replaceWith(document.createTextNode(n.alt ? `[${n.alt}]` : '[이미지]')));
-        template.content.querySelectorAll('br').forEach(n => n.replaceWith(document.createTextNode('\n')));
-        template.content.querySelectorAll('p,div,li,pre,blockquote,h1,h2,h3,h4,h5,h6,tr').forEach(n => n.append(document.createTextNode('\n')));
-        text = template.content.textContent || ''; available = true;
+    return blank || empty;
+  }
+
+  // Never attach nodes from untrusted HTML. Parse in an inert template, then rebuild
+  // a small allowlist with createElement/textContent. No arbitrary classes, styles,
+  // event handlers, custom elements, SVG, forms, IDs, srcset or data attributes survive.
+  const PREVIEW_TAGS = new Set('a p br strong b em i del s blockquote ul ol li h1 h2 h3 h4 h5 h6 pre code hr table thead tbody tfoot tr th td details summary span div kbd samp sup sub dl dt dd img input'.split(' '));
+  const PREVIEW_DROP = new Set('script style iframe object embed template noscript noembed noframes form button textarea select option base link meta audio video source canvas'.split(' '));
+  const renderedPreviewCache = new Map();
+  function previewUrl(raw, base, image = false) {
+    if (typeof raw !== 'string' || !raw.trim() || /[\u0000-\u001f\u007f]/.test(raw)) return '';
+    try {
+      const url = new URL(raw, base);
+      if (url.username || url.password) return '';
+      if (!image) return ['https:', 'http:', 'mailto:'].includes(url.protocol) ? url.href : '';
+      if (url.protocol !== 'https:') return '';
+      const hosted = ['camo.githubusercontent.com', 'user-images.githubusercontent.com',
+        'private-user-images.githubusercontent.com', 'raw.githubusercontent.com'].includes(url.hostname);
+      const attachment = url.hostname === 'github.com' && /^\/user-attachments\/assets\//.test(url.pathname);
+      return hosted || attachment ? url.href : '';
+    } catch { return ''; }
+  }
+  function safePreviewFragment(html, base, alreadyTruncated = false) {
+    const template = document.createElement('template'); template.innerHTML = html;
+    const fragment = document.createDocumentFragment();
+    let chars = 0, nodes = 0, truncated = alreadyTruncated;
+    function copy(source, target, depth) {
+      if (++nodes > CONFIG.maxPreviewNodes || depth > 48) { truncated = true; return; }
+      if (source.nodeType === Node.TEXT_NODE) {
+        const remaining = CONFIG.previewChars - chars;
+        if (source.data.length > remaining) truncated = true;
+        const text = source.data.slice(0, Math.max(0, remaining));
+        chars += text.length; if (text) target.append(document.createTextNode(text)); return;
+      }
+      if (source.nodeType !== Node.ELEMENT_NODE || source.namespaceURI !== 'http://www.w3.org/1999/xhtml') return;
+      const tag = source.localName;
+      if (PREVIEW_DROP.has(tag)) return;
+      if (tag === 'input' && (source.getAttribute('type') || '').toLowerCase() !== 'checkbox') return;
+      // Unknown HTML wrappers are unwrapped, not cloned or upgraded.
+      let out = target;
+      if (PREVIEW_TAGS.has(tag)) {
+        out = document.createElement(tag);
+        if (tag === 'a') {
+          const href = previewUrl(source.getAttribute('href'), base);
+          if (href) { out.href = href; out.target = '_blank'; out.rel = 'noopener noreferrer'; }
+        } else if (tag === 'img') {
+          const raw = source.getAttribute('src'), src = previewUrl(raw, base, true);
+          if (!src) {
+            const placeholder = document.createElement('a'), href = previewUrl(raw, base);
+            placeholder.textContent = `[이미지${source.getAttribute('alt') ? ': ' + source.getAttribute('alt').slice(0, 160) : ''}]`;
+            if (href) { placeholder.href = href; placeholder.target = '_blank'; placeholder.rel = 'noopener noreferrer'; }
+            target.append(placeholder); return;
+          }
+          out.alt = (source.getAttribute('alt') || '').slice(0, 300);
+          out.loading = 'lazy'; out.decoding = 'async'; out.referrerPolicy = 'no-referrer'; out.src = src;
+        } else if (tag === 'input') {
+          out.type = 'checkbox'; out.disabled = true; out.checked = source.hasAttribute('checked');
+          out.setAttribute('aria-label', out.checked ? '완료된 항목' : '미완료 항목');
+        } else if (tag === 'details') out.open = source.hasAttribute('open');
+        if (tag === 'ol' && /^-?\d{1,6}$/.test(source.getAttribute('start') || '')) out.start = Number(source.getAttribute('start'));
+        if (tag === 'th' || tag === 'td') {
+          for (const name of ['colspan', 'rowspan']) {
+            const value = Number(source.getAttribute(name));
+            if (Number.isInteger(value) && value > 0 && value <= 20) out.setAttribute(name, String(value));
+          }
+          const align = source.getAttribute('align');
+          if (['left', 'center', 'right'].includes(align)) out.style.textAlign = align;
+        }
+        if (tag === 'code' || tag === 'span') {
+          const names = [...source.classList].filter(c => /^(?:pl-[a-z0-9-]{1,24}|language-[a-z0-9_-]{1,24})$/i.test(c));
+          if (names.length) out.className = names.join(' ');
+        }
+        if (source.hasAttribute('title')) out.title = source.getAttribute('title').slice(0, 500);
+        target.append(out);
+      }
+      for (const child of source.childNodes) {
+        if (nodes >= CONFIG.maxPreviewNodes || chars >= CONFIG.previewChars) { truncated = true; break; }
+        copy(child, out, depth + 1);
       }
     }
-    text = (text || '').replace(/\r\n?/g, '\n').trim();
-    return { available, text: text.slice(0, CONFIG.previewChars), truncated: text.length > CONFIG.previewChars };
+    for (const child of template.content.childNodes) {
+      if (nodes >= CONFIG.maxPreviewNodes || chars >= CONFIG.previewChars) { truncated = true; break; }
+      copy(child, fragment, 0);
+    }
+    return { fragment, truncated, rich: true };
+  }
+  function renderedPreview(entry, base) {
+    let result = renderedPreviewCache.get(entry);
+    if (result) { renderedPreviewCache.delete(entry); renderedPreviewCache.set(entry, result); return result; }
+    try {
+      let html = entry.text;
+      if (entry.format === 'markdown') {
+        if (typeof marked === 'undefined' || typeof marked.parse !== 'function') throw new Error('renderer unavailable');
+        html = marked.parse(entry.text, { gfm: true, breaks: true, async: false });
+      }
+      if (entry.format === 'text') throw new Error('plain source');
+      if (typeof html !== 'string' || html.length > CONFIG.maxPreviewSourceChars * 4) throw new Error('render limit');
+      result = safePreviewFragment(html, base, entry.truncated);
+    } catch {
+      // Fail closed: do not put raw or partially filtered HTML into the live page.
+      const fragment = document.createDocumentFragment();
+      fragment.append(document.createTextNode(entry.text.slice(0, CONFIG.previewChars)));
+      result = { fragment, rich: false, truncated: entry.truncated || entry.text.length > CONFIG.previewChars,
+        fallback: entry.format !== 'text' };
+    }
+    if (!result.fragment.childNodes.length) result.fragment.append(document.createTextNode('표시할 본문이 없어.'));
+    renderedPreviewCache.set(entry, result); stats.previewRenders++;
+    while (renderedPreviewCache.size > CONFIG.maxRenderedPreviews) renderedPreviewCache.delete(renderedPreviewCache.keys().next().value);
+    return result;
   }
   function rememberPreview(info, me, result) {
     if (result.kind !== 'comment' || !result.preview) return;
@@ -534,7 +643,7 @@
       const permalink = [...header.querySelectorAll('a[href]')].find(a => a.getAttribute('href')?.endsWith(`#${node.id}`));
       const datetime = (permalink || header).querySelector('relative-time[datetime], time[datetime]')?.getAttribute('datetime');
       const candidate = commentFromNode({ __typename: 'IssueComment', url: `${info.url}#${node.id}`, createdAt: datetime,
-        author: { login: author }, bodyText: container.querySelector('.comment-body')?.textContent || '' }, info, me);
+        author: { login: author }, bodyHTML: container.querySelector('.comment-body')?.innerHTML || '' }, info, me);
       if (candidate) found.set(candidate.commentId, candidate);
     }
     if (found.size !== expected) throw fail('INCOMPLETE');
@@ -792,19 +901,41 @@
       .gh-lca-preview a{color:var(--lca-accent);white-space:nowrap}
       .gh-lca-preview :is(button,a,[tabindex]):focus-visible{outline:2px solid var(--lca-accent);outline-offset:-2px}
       .gh-lca-preview-close:hover{background:var(--lca-muted-bg)}
+      .gh-lca-preview-body.gh-lca-markdown{white-space:normal;color:var(--lca-fg)}
+      .gh-lca-markdown>:first-child{margin-top:0!important}.gh-lca-markdown>:last-child{margin-bottom:0!important}
+      .gh-lca-markdown :is(p,blockquote,ul,ol,dl,table,pre,details){margin:0 0 10px}
+      .gh-lca-markdown :is(h1,h2,h3,h4,h5,h6){margin:16px 0 8px;font-weight:600;line-height:1.35;color:var(--lca-fg)}
+      .gh-lca-markdown h1{font-size:20px}.gh-lca-markdown h2{font-size:17px}.gh-lca-markdown h3{font-size:15px}.gh-lca-markdown :is(h4,h5,h6){font-size:13px}
+      .gh-lca-markdown :is(h1,h2){border-bottom:1px solid var(--lca-border);padding-bottom:5px}
+      .gh-lca-markdown :is(ul,ol){padding-left:22px}.gh-lca-markdown li{margin:3px 0}.gh-lca-markdown li>p{margin:4px 0}.gh-lca-markdown li>:is(ul,ol){margin:4px 0}
+      .gh-lca-markdown blockquote{border-left:3px solid var(--lca-border);padding:2px 0 2px 10px;color:var(--lca-muted)}
+      .gh-lca-markdown blockquote>:last-child{margin-bottom:0}
+      .gh-lca-markdown :is(code,pre,kbd,samp){font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}
+      .gh-lca-markdown :not(pre)>code{padding:1px 4px;border-radius:4px;background:var(--lca-muted-bg);white-space:break-spaces}
+      .gh-lca-markdown pre{padding:10px;border:1px solid var(--lca-border);border-radius:6px;background:var(--lca-muted-bg);max-width:100%;overflow:auto;white-space:pre;line-height:1.5}
+      .gh-lca-markdown pre code{padding:0;border:0;background:none;white-space:pre;overflow-wrap:normal}
+      .gh-lca-markdown table{display:block;width:max-content;max-width:100%;overflow:auto;border-collapse:collapse;white-space:normal;font-size:12px}
+      .gh-lca-markdown :is(th,td){border:1px solid var(--lca-border);padding:5px 9px;min-width:56px}.gh-lca-markdown th{background:var(--lca-muted-bg);font-weight:600}
+      .gh-lca-markdown tr:nth-child(even){background:var(--lca-muted-bg)}
+      .gh-lca-markdown a{white-space:normal;overflow-wrap:anywhere;text-decoration:underline;text-underline-offset:2px}
+      .gh-lca-markdown input[type="checkbox"]{margin:0 5px 0 0;vertical-align:middle;accent-color:var(--lca-accent)}
+      .gh-lca-markdown img{display:block;max-width:100%;height:auto;max-height:260px;object-fit:contain;border-radius:4px;margin:8px 0}
+      .gh-lca-markdown hr{border:0;border-top:1px solid var(--lca-border);margin:14px 0}.gh-lca-markdown summary{cursor:pointer;font-weight:600}
+      .gh-lca-markdown kbd{padding:1px 4px;border:1px solid var(--lca-border);border-radius:3px}.gh-lca-markdown dt{font-weight:600}.gh-lca-markdown dd{margin-left:20px}
+      @media(max-width:560px){.gh-lca-line{flex-wrap:wrap;align-items:flex-start}.${MARKER} .gh-lca-main{flex-wrap:wrap;row-gap:0}.${MARKER} .gh-lca-time{flex-basis:100%}.gh-lca-line-label{line-height:26px}}
       @media(prefers-reduced-motion:reduce){.${MARKER} *{animation:none!important;transition:none!important}}
       @media(forced-colors:active){.gh-lca-line,.${MARKER},.gh-lca-preview,.gh-lca-bar{border:1px solid CanvasText}.${MARKER} .gh-lca-flag{outline:1px solid CanvasText}}
     `;
   }
   const dateFormatter = new Intl.DateTimeFormat('ko-KR', {
     timeZone: 'Asia/Seoul', year: 'numeric', month: 'numeric', day: 'numeric', weekday: 'short',
-    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    hour: 'numeric', minute: '2-digit', hourCycle: 'h12',
   });
   function calendarDate(value, exact = false) {
     const date = new Date(value);
     if (!Number.isFinite(date.getTime())) return '';
     const p = Object.fromEntries(dateFormatter.formatToParts(date).map(v => [v.type, v.value]));
-    return `${exact ? p.year + '.' : ''}${p.month}.${p.day} (${p.weekday})${exact ? ' ' + p.hour + ':' + p.minute + ' KST' : ''}`;
+    return `${exact ? p.year + '.' : ''}${p.month}.${p.day} (${p.weekday}) ${p.dayPeriod} ${p.hour}:${p.minute}${exact ? ' KST' : ''}`;
   }
   function markerKind(result, me) {
     if (result.kind === 'none') return 'none';
@@ -898,7 +1029,7 @@
   }
 
   const PREVIEW_ID = 'gh-lca-comment-preview';
-  const preview = { panel: null, record: null, openTimer: null, closeTimer: null, positionFrame: null, requested: false, dismissed: null, suppressHover: false, pointer: null, hovered: null };
+  const preview = { panel: null, record: null, openTimer: null, closeTimer: null, positionFrame: null, requested: false, dismissed: null, suppressHover: false, pointer: null, hovered: null, renderedEntry: null, renderedMessage: null };
   function ensurePreview() {
     if (preview.panel?.isConnected) return preview.panel;
     const panel = textNode('section', 'gh-lca-preview'); panel.id = PREVIEW_ID; panel.hidden = true; panel.setAttribute(OWN, '');
@@ -916,6 +1047,14 @@
     panel.addEventListener('focusout', () => schedulePreviewClose());
     // Do not leak popup clicks to GitHub's row navigation.
     panel.addEventListener('click', event => event.stopPropagation());
+    panel.addEventListener('load', () => positionPreviewSoon(), true);
+    panel.addEventListener('error', event => {
+      if (event.target instanceof HTMLImageElement) {
+        event.target.replaceWith(document.createTextNode(`[이미지 로드 실패${event.target.alt ? ': ' + event.target.alt : ''}]`));
+        positionPreviewSoon();
+      }
+    }, true);
+    panel.addEventListener('toggle', () => positionPreviewSoon(), true);
     document.body.append(panel); preview.panel = panel; return panel;
   }
   function schedulePreviewClose() {
@@ -931,7 +1070,7 @@
     if (preview.positionFrame !== null) cancelAnimationFrame(preview.positionFrame);
     preview.positionFrame = null;
     const record = preview.record, hadFocus = preview.panel?.contains(document.activeElement);
-    preview.record = null; preview.requested = false;
+    preview.record = null; preview.requested = false; preview.renderedEntry = null; preview.renderedMessage = null;
     if (dismiss) { preview.dismissed = record; preview.suppressHover = true; }
     if (preview.panel) { preview.panel.hidden = true; preview.panel.querySelector('.gh-lca-preview-body').textContent = ''; }
     if (record) {
@@ -979,17 +1118,30 @@
     setText(panel.querySelector('.gh-lca-preview-heading'), `${value.author ? '@' + value.author : '작성자 정보 없음'} · ${calendarDate(value.time, true)}`);
     const busy = record.state === 'loading' || record.state === 'queued';
     const stale = Date.now() >= record.freshUntil || !!record.error || record.forced;
-    let body, note;
-    if (entry) {
-      body = entry.available ? entry.text || '텍스트 본문이 비어 있어.' : '이 응답에는 댓글 본문이 없어서 미리 볼 수 없어. 아래에서 댓글을 열어줘.';
-      note = `${stale ? '이전 조회 결과 · ' : ''}${entry.truncated ? '앞 16,000자만 표시 · ' : ''}텍스트 미리보기`;
+    const bodyNode = panel.querySelector('.gh-lca-preview-body');
+    let note;
+    if (entry?.available) {
+      const rendered = renderedPreview(entry, value.commentUrl);
+      // Status/TTL updates must not recreate the body, reset scroll, close details,
+      // clear a text selection, or reload images while the user is reading it.
+      if (preview.renderedEntry !== entry) {
+        bodyNode.replaceChildren(rendered.fragment.cloneNode(true));
+        bodyNode.classList.toggle('gh-lca-markdown', rendered.rich); bodyNode.scrollTop = 0;
+        preview.renderedEntry = entry; preview.renderedMessage = null;
+      }
+      note = `${stale ? '이전 조회 결과 · ' : ''}${rendered.truncated ? '긴 댓글 일부만 표시 · ' : ''}${rendered.rich ? '마크다운 미리보기' : rendered.fallback ? '서식 변환 불가 · 원문 표시' : '텍스트만 제공된 댓글'}`;
       if (record.error) note += ' · 새 조회 실패';
     } else {
-      body = record.error ? `${record.error.message}\n배지의 새로고침 버튼으로 다시 시도해.` : !networkAllowed() ? '조회가 멈춰 있어. 조회를 재개하거나 네트워크 연결을 확인해.' : '댓글 본문을 불러오는 중…';
+      const message = entry ? '이 응답에는 댓글 본문이 없어서 미리 볼 수 없어. 아래에서 댓글을 열어줘.' :
+        record.error ? `${record.error.message}\n배지의 새로고침 버튼으로 다시 시도해.` :
+        !networkAllowed() ? '조회가 멈춰 있어. 조회를 재개하거나 네트워크 연결을 확인해.' : '댓글 본문을 불러오는 중…';
+      if (preview.renderedEntry || preview.renderedMessage !== message) {
+        bodyNode.textContent = message; bodyNode.classList.remove('gh-lca-markdown'); bodyNode.scrollTop = 0;
+        preview.renderedEntry = null; preview.renderedMessage = message;
+      }
       note = '본문은 이 페이지의 메모리에만 보관해';
     }
-    const bodyNode = panel.querySelector('.gh-lca-preview-body');
-    setText(bodyNode, body); bodyNode.setAttribute('aria-busy', String(busy && !entry));
+    bodyNode.setAttribute('aria-busy', String(busy && !entry));
     setText(panel.querySelector('.gh-lca-preview-note'), note);
     panel.querySelector('.gh-lca-preview-open').href = value.commentUrl;
     positionPreviewSoon();
@@ -1089,7 +1241,7 @@
     clearTimeout(pumpTimer);
   }
   function resetContext(clearCache = false) {
-    closePreview(); previewCache.clear();
+    closePreview(); previewCache.clear(); renderedPreviewCache.clear();
     context.controller.abort(); cancelJobs();
     for (const record of [...records.values()]) removeRecord(record);
     rowRecords = new WeakMap(); dirtyRoots.clear();
@@ -1103,6 +1255,32 @@
     return ctx === context && ctx.identity === identity() && !ctx.controller.signal.aborted && record.version === version &&
       record.link.isConnected && parseConversationUrl(record.link.href)?.key === record.info.key &&
       rowSignature(record.row) === record.signature;
+  }
+  async function runJob(job) {
+    try {
+      // 대기 중인 행에는 아직 fetchLastComment와 120초 타이머를 만들지 않는다.
+      const result = await fetchLastComment(job.info, job.ctx.me, job.controller.signal);
+      if (job.controller.signal.aborted) return;
+      const current = [...job.subscribers].filter(([r, v]) => r.job === job && stillCurrent(r, job.ctx, v));
+      if (!current.length) return;
+      const entry = setCache(job.info, job.signature, job.ctx.me, result);
+      for (const [record] of current) { record.job = null; applyEntry(record, entry); stats.successes++; }
+    } catch (error) {
+      if (error?.code === 'ABORTED' || job.controller.signal.aborted) { stats.cancelled++; return; }
+      const safe = error instanceof LcaError ? error : fail('PAGE_SHAPE');
+      for (const [record, version] of job.subscribers) {
+        if (record.job !== job || !stillCurrent(record, job.ctx, version)) continue;
+        record.job = null; record.state = 'error'; record.error = safe; record.forced = false;
+        stats.failures++; paint(record);
+      }
+      log('item_error', { item: alias(job.info), code: safe.code, status: safe.status });
+    } finally {
+      // 외부 확장이나 React가 행을 바꿨다면 다음 증분 스캔이 새 정보를 처리한다.
+      for (const [record] of job.subscribers) if (record.job === job) {
+        record.job = null; record.state = record.value ? 'done' : 'new';
+        if (record.link.isConnected && job.ctx === context) scheduleScan(record.row);
+      }
+    }
   }
   function enqueue(record, force = false) {
     if (!record.link.isConnected || (!record.near && !force)) return;
@@ -1149,32 +1327,6 @@
     if (job.subscribers.size) stats.sharedJobs++;
     recordQueue.delete(record); job.subscribers.set(record, record.version);
     record.job = job; record.state = 'loading'; record.lastAttempt = Date.now(); paint(record);
-  }
-  async function runJob(job) {
-    try {
-      // 대기 중인 행에는 아직 fetchLastComment와 120초 타이머를 만들지 않는다.
-      const result = await fetchLastComment(job.info, job.ctx.me, job.controller.signal);
-      if (job.controller.signal.aborted) return;
-      const current = [...job.subscribers].filter(([r, v]) => r.job === job && stillCurrent(r, job.ctx, v));
-      if (!current.length) return;
-      const entry = setCache(job.info, job.signature, job.ctx.me, result);
-      for (const [record] of current) { record.job = null; applyEntry(record, entry); stats.successes++; }
-    } catch (error) {
-      if (error?.code === 'ABORTED' || job.controller.signal.aborted) { stats.cancelled++; return; }
-      const safe = error instanceof LcaError ? error : fail('PAGE_SHAPE');
-      for (const [record, version] of job.subscribers) {
-        if (record.job !== job || !stillCurrent(record, job.ctx, version)) continue;
-        record.job = null; record.state = 'error'; record.error = safe; record.forced = false;
-        stats.failures++; paint(record);
-      }
-      log('item_error', { item: alias(job.info), code: safe.code, status: safe.status });
-    } finally {
-      // 외부 확장이나 React가 행을 바꿨다면 다음 증분 스캔이 새 정보를 처리한다.
-      for (const [record] of job.subscribers) if (record.job === job) {
-        record.job = null; record.state = record.value ? 'done' : 'new';
-        if (record.link.isConnected && job.ctx === context) scheduleScan(record.row);
-      }
-    }
   }
   const nearObserver = typeof IntersectionObserver === 'function' ? new IntersectionObserver(entries => {
     for (const entry of entries) {
@@ -1379,7 +1531,8 @@
     const report = { version: VERSION, capturedAt: new Date().toISOString(), route: routeKind() || 'other',
       note: '댓글 본문·작성자·저장소명·이슈 주소·쿠키·토큰·GraphQL 변수는 포함하지 않음. 자동 전송하지 않음.',
       config: CONFIG, preferences: prefs, stats: { ...stats, activeRequests, queuedRequests: requestQueue.length,
-        activeIssueJobs: jobs.size, queuedIssues: recordQueue.size, memoryEntries: memoryCache.size },
+        activeIssueJobs: jobs.size, queuedIssues: recordQueue.size, memoryEntries: memoryCache.size,
+        renderedPreviews: renderedPreviewCache.size },
       learnedQueryDiffersFromFallback: queryHash !== FALLBACK_QUERY, events: [...events] };
     const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob), a = document.createElement('a');
@@ -1401,7 +1554,7 @@
   window.addEventListener('popstate', navigationChanged);
   window.addEventListener('online', () => { maintain(); pump(); });
   window.addEventListener('offline', () => { cancelJobs(); for (const r of records.values()) paint(r); updateToolbar(); });
-  window.addEventListener('pagehide', () => { closePreview(); previewCache.clear(); cancelJobs(); clearTimeout(maintenanceTimer); });
+  window.addEventListener('pagehide', () => { closePreview(); previewCache.clear(); renderedPreviewCache.clear(); cancelJobs(); clearTimeout(maintenanceTimer); });
   window.addEventListener('pageshow', event => { if (event.persisted) navigationChanged(); });
   // Chromium의 pushState/replaceState도 잡는다. 지원하지 않는 환경은 GitHub 내비게이션 이벤트와 DOM 관찰을 사용한다.
   if (window.navigation?.addEventListener) window.navigation.addEventListener('currententrychange', navigationChanged);
